@@ -125,3 +125,59 @@ def run_developer(
     return run_agent_turn(
         model, tools, workspace, history, augmented_task, role_prompt=DEVELOPER_ROLE_PROMPT
     )
+
+
+REVIEWER_ROLE_PROMPT = """You are acting as SkyTrap's Reviewer role. Below is the task the \
+user asked for, the diff of the changes the Developer role just made to implement it, \
+and the result of running the test suite afterward.
+
+Check the test result FIRST: if it failed, that is always a real issue — say so \
+explicitly and, if the diff makes the cause obvious, name it (e.g. a typo'd method \
+name, a wrong import). Do not say "No issues found" when the tests are failing.
+
+Then review the diff itself for further problems: correctness bugs, security issues \
+(path traversal, injection, secrets, unsafe subprocess/eval use), and any obvious \
+quality issues (missed edge cases, dead code, mismatched naming). You have read-only \
+tools if you need more context than the diff alone gives you (e.g. to see how a \
+modified function is actually called elsewhere).
+
+Do not rewrite the code yourself — only report findings, each as a short line naming \
+the file and the concern. If tests passed and you genuinely find nothing else \
+significant, say so plainly ("No issues found.") — do not invent problems just to \
+appear thorough; a short, honest review is more useful than a padded one.
+
+Respond with type "final" containing your review."""
+
+
+def run_reviewer(
+    model: ModelProvider,
+    workspace: WorkspaceContext,
+    task: str,
+    diff_text: str,
+    test_output: str,
+    tests_passed: bool,
+) -> str:
+    """Reviews a diff already produced by the Developer role — read-only, reports
+    findings without touching the workspace. `diff_text` is passed in directly (from
+    review_diff()) rather than re-derived, so the Reviewer looks at exactly what the
+    Developer just did, not the live working tree state. `test_output`/`tests_passed`
+    are included too: a diff that made the test suite fail is the single most important
+    thing to flag, and the Reviewer can't know that from the diff text alone.
+    """
+    read_only_tools = [
+        ReadFileTool(),
+        ListDirectoryTool(),
+        SearchCodeTool(),
+        GitStatusTool(),
+        GitDiffTool(),
+    ]
+    history: list[dict] = []
+    test_status = "PASSED" if tests_passed else "FAILED"
+    prompt_input = (
+        f"Task: {task}\n\n"
+        f"Diff to review:\n{diff_text}\n\n"
+        f"Test suite result ({test_status}):\n{test_output}"
+    )
+    return run_agent_turn(
+        model, read_only_tools, workspace, history, prompt_input, role_prompt=REVIEWER_ROLE_PROMPT
+    )

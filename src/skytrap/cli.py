@@ -2,7 +2,7 @@ import typer
 
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import detect_workspace
-from skytrap.core.roles import run_architect, run_developer
+from skytrap.core.roles import run_architect, run_developer, run_reviewer
 from skytrap.memory.sqlite import SqliteMemory
 from skytrap.models.ollama import OllamaProvider
 from skytrap.tools.base import Tool
@@ -20,6 +20,7 @@ from skytrap.ui.terminal import (
     print_developer_summary,
     print_diff_summary,
     print_plan,
+    print_review,
     print_test_result,
     run_chat_loop,
 )
@@ -107,11 +108,19 @@ def build(task: str) -> None:
     test_result = RunTestsTool().execute(workspace, {})
     print_test_result(test_result.output, test_result.success)
 
-    if touched_files:
-        # Scoped to what the Developer actually wrote, not the whole working tree —
-        # otherwise pre-existing unrelated uncommitted changes would show up here too.
-        diff_result = review_diff(workspace, touched_files)
-        if diff_result.success:
-            print_diff_summary(diff_result.output)
-    else:
+    if not touched_files:
         console.print("[dim]No files were written.[/dim]")
+        return
+
+    # Scoped to what the Developer actually wrote, not the whole working tree —
+    # otherwise pre-existing unrelated uncommitted changes would show up here too.
+    diff_result = review_diff(workspace, touched_files)
+    if not diff_result.success:
+        return
+    print_diff_summary(diff_result.output)
+
+    console.print("[dim]Reviewer is analyzing the diff...[/dim]")
+    review = run_reviewer(
+        model, workspace, task, diff_result.output, test_result.output, test_result.success
+    )
+    print_review(review)

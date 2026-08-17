@@ -75,7 +75,13 @@ def print_diff_summary(diff_text: str) -> None:
         if diff_text.startswith(("---", "+++", "@@"))
         else diff_text
     )
-    console.print(Panel(syntax, title="Diff (Reviewer)", border_style="cyan", padding=(1, 2)))
+    console.print(Panel(syntax, title="Diff", border_style="cyan", padding=(1, 2)))
+
+
+def print_review(review_text: str) -> None:
+    console.print(
+        Panel(review_text, title="Reviewer", border_style="magenta", padding=(1, 2))
+    )
 
 
 def run_chat_loop(respond: Callable[[str], str]) -> None:
