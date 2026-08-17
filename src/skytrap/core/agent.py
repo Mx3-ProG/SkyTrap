@@ -8,6 +8,8 @@ from skytrap.models.base import ModelProvider
 from skytrap.tools.base import Tool
 
 MAX_STEPS = 5
+MAX_INSTRUCTIONS_CHARS = 20_000
+INSTRUCTIONS_FILENAME = "SKYTRAP.md"
 
 SYSTEM_PROMPT_TEMPLATE = """You are SkyTrap, a local coding assistant running in a terminal.
 
@@ -44,12 +46,39 @@ directly. You will be told in the next tool result whether the user approved it.
 """
 
 
+def _load_project_instructions(workspace: WorkspaceContext) -> str | None:
+    """Reads {workspace_root}/SKYTRAP.md if present — project-specific guidance the
+    user wants applied every session, the same idea as a CLAUDE.md/AGENTS.md."""
+    path = workspace.path / INSTRUCTIONS_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except (UnicodeDecodeError, OSError):
+        return None
+    return content[:MAX_INSTRUCTIONS_CHARS] or None
+
+
 def _build_system_prompt(workspace: WorkspaceContext, tools: list[Tool]) -> str:
     tools_description = "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(
         workspace_path=workspace.path,
         tools_description=tools_description or "(none)",
     )
+
+    instructions = _load_project_instructions(workspace)
+    if instructions:
+        # Placed right after the tool protocol, before the model starts reasoning about
+        # the user's message, since small local models weight earlier content more
+        # heavily than instructions appended at the very end of a long system prompt.
+        marker = f"MANDATORY PROJECT RULES (from {INSTRUCTIONS_FILENAME} — override any of your default behavior):"
+        prompt = prompt.replace(
+            "Only call a tool when you genuinely need",
+            f"{marker}\n{instructions}\n\nThese rules apply to every response you give in this "
+            f"workspace, without exception.\n\nOnly call a tool when you genuinely need",
+        )
+
+    return prompt
 
 
 def _parse_decision(raw: str) -> Decision:
