@@ -42,6 +42,16 @@ def print_banner(model: ModelProvider, workspace: WorkspaceContext) -> None:
     )
 
 
+def print_plan(plan_text: str) -> None:
+    console.print(
+        Panel(plan_text, title="Architect plan", border_style="cyan", padding=(1, 2))
+    )
+    console.print(
+        "[dim]Read-only analysis — nothing was changed. "
+        "Run `skytrap` to have SkyTrap implement it.[/dim]"
+    )
+
+
 def run_chat_loop(respond: Callable[[str], str]) -> None:
     console.print()
     while True:

@@ -1,4 +1,5 @@
 import json
+import re
 
 from pydantic import ValidationError
 
@@ -64,13 +65,20 @@ def _load_project_instructions(workspace: WorkspaceContext) -> str | None:
     return content[:MAX_INSTRUCTIONS_CHARS] or None
 
 
-def _build_system_prompt(workspace: WorkspaceContext, tools: list[Tool]) -> str:
+def _build_system_prompt(
+    workspace: WorkspaceContext, tools: list[Tool], role_prompt: str | None = None
+) -> str:
     tools_description = "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
     prompt = SYSTEM_PROMPT_TEMPLATE.format(
         workspace_path=workspace.path,
         repo_map=build_repo_map(workspace),
         tools_description=tools_description or "(none)",
     )
+
+    if role_prompt:
+        # Placed first, before anything else, for maximum salience — a role override
+        # (e.g. Architect: read-only, plan-only) matters more than the generic framing.
+        prompt = f"{role_prompt}\n\n{prompt}"
 
     instructions = _load_project_instructions(workspace)
     if instructions:
@@ -87,6 +95,30 @@ def _build_system_prompt(workspace: WorkspaceContext, tools: list[Tool]) -> str:
     return prompt
 
 
+def _repair_final_message(text: str) -> str | None:
+    """Best-effort recovery for a `{"type": "final", "message": "..."}` response whose
+    message contains raw, unescaped double quotes (e.g. the model quoting a code
+    snippet like {"path": ...} inline) — this breaks JSON string boundaries in a way
+    strict/non-strict json.loads can't recover from, since the quotes are genuinely
+    ambiguous to a real parser. Only handles the "final" shape; a malformed tool_call
+    is deliberately left to fail rather than risk executing a guessed-at repair.
+    """
+    if not re.search(r'"type"\s*:\s*"final"', text):
+        return None
+
+    message_key = re.search(r'"message"\s*:\s*"', text)
+    if not message_key:
+        return None
+
+    quote_start = message_key.end()
+    quote_end = text.rfind('"')
+    if quote_end <= quote_start:
+        return None
+
+    raw_message = text[quote_start:quote_end]
+    return raw_message.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+
+
 def _parse_decision(raw: str) -> Decision:
     text = raw.strip()
     if text.startswith("```"):
@@ -95,13 +127,23 @@ def _parse_decision(raw: str) -> Decision:
             text = text[len("json") :]
         text = text.strip()
 
-    try:
-        data = json.loads(text)
-        return Decision.model_validate(data)
-    except (json.JSONDecodeError, ValidationError):
-        # Model didn't follow the protocol — treat its raw text as the final answer
-        # rather than failing the turn outright.
-        return Decision(type="final", message=raw)
+    for strict in (True, False):
+        # strict=False tolerates literal control characters (raw newlines, tabs) inside
+        # JSON strings — models routinely emit multi-line "message" values that way
+        # instead of escaping them as \n, which strict JSON rejects.
+        try:
+            data = json.loads(text, strict=strict)
+            return Decision.model_validate(data)
+        except (json.JSONDecodeError, ValidationError):
+            continue
+
+    repaired = _repair_final_message(text)
+    if repaired is not None:
+        return Decision(type="final", message=repaired)
+
+    # Model didn't follow the protocol at all — treat its raw text as the final answer
+    # rather than failing the turn outright.
+    return Decision(type="final", message=raw)
 
 
 def run_agent_turn(
@@ -110,13 +152,15 @@ def run_agent_turn(
     workspace: WorkspaceContext,
     history: list[dict],
     user_input: str,
+    role_prompt: str | None = None,
 ) -> str:
     """Runs one observe -> decide -> act -> observe loop until the model gives a
     final answer or MAX_STEPS is reached. `history` is mutated in place so the
-    conversation carries over between turns.
+    conversation carries over between turns. `role_prompt`, if given, overrides the
+    generic assistant framing (e.g. a restricted Architect role).
     """
     tools_by_name = {tool.name: tool for tool in tools}
-    messages = [{"role": "system", "content": _build_system_prompt(workspace, tools)}]
+    messages = [{"role": "system", "content": _build_system_prompt(workspace, tools, role_prompt)}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_input})
 
