@@ -7,6 +7,7 @@ from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool, WriteFileT
 from skytrap.tools.git import GitDiffTool, GitStatusTool
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.shell import ShellTool
+from skytrap.tools.tests import RunTestsTool
 from skytrap.ui.terminal import confirm_shell, confirm_write, print_banner, run_chat_loop
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
@@ -27,6 +28,7 @@ def main(ctx: typer.Context) -> None:
         GitDiffTool(),
         WriteFileTool(confirm=confirm_write),
         ShellTool(confirm=confirm_shell),
+        RunTestsTool(),
     ]
     history: list[dict] = []
 
