@@ -4,6 +4,7 @@ from pydantic import ValidationError
 
 from skytrap.core.context import WorkspaceContext
 from skytrap.core.protocol import Decision
+from skytrap.core.repo_map import build_repo_map
 from skytrap.models.base import ModelProvider
 from skytrap.tools.base import Tool
 
@@ -14,6 +15,10 @@ INSTRUCTIONS_FILENAME = "SKYTRAP.md"
 SYSTEM_PROMPT_TEMPLATE = """You are SkyTrap, a local coding assistant running in a terminal.
 
 Workspace root: {workspace_path}
+
+Workspace file structure (for orientation — read_file/list_directory still show \
+actual content, this is just a map):
+{repo_map}
 
 Available tools:
 {tools_description}
@@ -63,6 +68,7 @@ def _build_system_prompt(workspace: WorkspaceContext, tools: list[Tool]) -> str:
     tools_description = "\n".join(f"- {tool.name}: {tool.description}" for tool in tools)
     prompt = SYSTEM_PROMPT_TEMPLATE.format(
         workspace_path=workspace.path,
+        repo_map=build_repo_map(workspace),
         tools_description=tools_description or "(none)",
     )
 

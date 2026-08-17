@@ -17,6 +17,9 @@ IGNORED_DIRS = {
     "venv",
     "__pycache__",
     ".cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
 }
 
 
