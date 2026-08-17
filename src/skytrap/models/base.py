@@ -8,8 +8,8 @@ class ModelProvider(ABC):
     engine: str  # "LOCAL", "HYBRID", "CLOUD"
 
     @abstractmethod
-    def generate(self, prompt: str) -> str:
-        """Send a prompt to the model and return its full text response."""
+    def chat(self, messages: list[dict]) -> str:
+        """Send a chat history (list of {"role", "content"}) and return the model's reply text."""
         raise NotImplementedError
 
     @property

@@ -1,3 +1,5 @@
+from typing import Callable
+
 from rich.console import Console
 from rich.panel import Panel
 
@@ -21,7 +23,7 @@ def print_banner(model: ModelProvider, workspace: WorkspaceContext) -> None:
     )
 
 
-def run_chat_loop(model: ModelProvider) -> None:
+def run_chat_loop(respond: Callable[[str], str]) -> None:
     console.print()
     while True:
         try:
@@ -38,7 +40,7 @@ def run_chat_loop(model: ModelProvider) -> None:
 
         with console.status("[dim]thinking...[/dim]", spinner="dots"):
             try:
-                reply = model.generate(stripped)
+                reply = respond(stripped)
             except Exception as exc:  # noqa: BLE001 - surface any backend failure to the user
                 console.print(f"[bold red]Error:[/bold red] {exc}")
                 continue

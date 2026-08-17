@@ -15,11 +15,11 @@ class OllamaProvider(ModelProvider):
         self.name = model
         self.base_url = base_url
 
-    def generate(self, prompt: str) -> str:
+    def chat(self, messages: list[dict]) -> str:
         response = httpx.post(
-            f"{self.base_url}/api/generate",
-            json={"model": self.name, "prompt": prompt, "stream": False},
+            f"{self.base_url}/api/chat",
+            json={"model": self.name, "messages": messages, "stream": False},
             timeout=120.0,
         )
         response.raise_for_status()
-        return response.json()["response"]
+        return response.json()["message"]["content"]
