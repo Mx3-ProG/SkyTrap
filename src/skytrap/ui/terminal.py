@@ -22,6 +22,12 @@ def confirm_write(preview: str) -> bool:
     return Confirm.ask("Apply this write?", default=False)
 
 
+def confirm_shell(preview: str) -> bool:
+    """Shows the pending shell command and asks the user to approve running it."""
+    console.print(Panel(preview, title="Run shell command?", border_style="yellow", padding=(1, 2)))
+    return Confirm.ask("Run this command?", default=False)
+
+
 def print_banner(model: ModelProvider, workspace: WorkspaceContext) -> None:
     branch_display = workspace.branch if workspace.is_git else "no git repo"
     body = (

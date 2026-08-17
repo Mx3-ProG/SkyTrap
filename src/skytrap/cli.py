@@ -6,7 +6,8 @@ from skytrap.models.ollama import OllamaProvider
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool, WriteFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool
 from skytrap.tools.search import SearchCodeTool
-from skytrap.ui.terminal import confirm_write, print_banner, run_chat_loop
+from skytrap.tools.shell import ShellTool
+from skytrap.ui.terminal import confirm_shell, confirm_write, print_banner, run_chat_loop
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 
@@ -25,6 +26,7 @@ def main(ctx: typer.Context) -> None:
         GitStatusTool(),
         GitDiffTool(),
         WriteFileTool(confirm=confirm_write),
+        ShellTool(confirm=confirm_shell),
     ]
     history: list[dict] = []
 
