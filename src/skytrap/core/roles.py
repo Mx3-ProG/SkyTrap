@@ -1,6 +1,7 @@
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext
 from skytrap.models.base import ModelProvider
+from skytrap.tools.base import Tool
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool
 from skytrap.tools.search import SearchCodeTool
@@ -21,9 +22,15 @@ You must NOT attempt to implement anything yourself: do not write code, do not w
 out file contents, do not describe a diff, and do not claim the change has already been \
 made. Only the plan.
 
-You only have read-only tools available (no write_file, no shell, no run_tests) — use \
-them to check the actual code before proposing steps; do not guess at file contents or \
-structure you haven't actually looked at.
+You (the Architect) only have read-only tools available (no write_file, no shell, no \
+run_tests) — use them to check the actual code before proposing steps; do not guess at \
+file contents or structure you haven't actually looked at. But SkyTrap itself has \
+write_file, shell, and run_tests, and the Developer who implements your plan next WILL \
+have them — never say a tool "is not available" or "doesn't exist in the workspace" as \
+a reason not to plan a step; that confuses your own current toolset with what the \
+project and the next role can actually do. If a step needs write_file, just write \
+"create/edit <path> with <content>" in the plan — you're describing what the Developer \
+will do, not doing it yourself.
 
 Example of the kind of plan you should produce, for "add a delete_file tool":
 1. In src/skytrap/tools/filesystem.py, add a DeleteFileTool class (same pattern as
@@ -40,10 +47,30 @@ When you are done analyzing, respond with type "final" and put the numbered plan
 the message."""
 
 
+_REFUSAL_PATTERNS = (
+    "is not available",
+    "i apologize",
+    "i cannot",
+    "cannot do the task",
+    "not able to",
+    "doesn't exist in the workspace",
+)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    lowered = text.lower()
+    return any(pattern in lowered for pattern in _REFUSAL_PATTERNS)
+
+
 def run_architect(model: ModelProvider, workspace: WorkspaceContext, task: str) -> str:
     """One-shot, read-only analysis: produces an implementation plan without touching
     the workspace. Each call is stateless (no shared history) since this is meant to be
     invoked explicitly per task, not as part of an ongoing conversation.
+
+    qwen2.5-coder:7b occasionally misreads its own read-only toolset as "SkyTrap can't
+    do this" and refuses instead of planning — a real, observed failure mode, not
+    hypothetical. One retry catches most of these without masking a genuinely broken
+    task (if it refuses twice, that's returned as-is rather than looping forever).
     """
     read_only_tools = [
         ReadFileTool(),
@@ -52,7 +79,49 @@ def run_architect(model: ModelProvider, workspace: WorkspaceContext, task: str) 
         GitStatusTool(),
         GitDiffTool(),
     ]
+
+    for _ in range(2):
+        history: list[dict] = []
+        result = run_agent_turn(
+            model, read_only_tools, workspace, history, task, role_prompt=ARCHITECT_ROLE_PROMPT
+        )
+        if not _looks_like_refusal(result):
+            return result
+
+    return result
+
+
+DEVELOPER_ROLE_PROMPT = """You are acting as SkyTrap's Developer role. You have been given \
+an implementation plan below for the user's task — follow it, but use your own judgment \
+if you discover the plan doesn't quite match what the code actually looks like once you \
+open the relevant files.
+
+The plan was written by a different role (the Architect) that only had read-only tools \
+and sometimes incorrectly claims in its own text that write_file/shell/etc. "are not \
+available" — that claim was about the Architect's toolset, not yours, and it may simply \
+be wrong. Trust the "Available tools" list in this system prompt above, not any claim \
+about tool availability written inside the plan text itself. If write_file is listed \
+above, you have it — use it; do not repeat or agree with a plan that says otherwise.
+
+Implement the change using the available tools: write_file to create or edit files, \
+shell for anything else needed, run_tests to check your work once you're done. Every \
+write_file and shell call already shows the user a preview and asks for their approval \
+before anything happens — that confirmation is handled automatically outside of you, so \
+just call the tool directly, one call per response as usual.
+
+When you have implemented the plan, respond with type "final" and briefly summarize \
+what you changed (which files, what for) — not a restatement of the plan."""
+
+
+def run_developer(
+    model: ModelProvider, tools: list[Tool], workspace: WorkspaceContext, task: str, plan: str
+) -> str:
+    """Implements a plan produced by run_architect, using the full (mutating) toolset
+    the caller passes in. Each write_file/shell call still goes through its own
+    confirmation gate — this role doesn't bypass that, it just decides what to call.
+    """
     history: list[dict] = []
+    augmented_task = f"{task}\n\nImplementation plan to follow:\n{plan}"
     return run_agent_turn(
-        model, read_only_tools, workspace, history, task, role_prompt=ARCHITECT_ROLE_PROMPT
+        model, tools, workspace, history, augmented_task, role_prompt=DEVELOPER_ROLE_PROMPT
     )

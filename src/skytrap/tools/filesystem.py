@@ -110,10 +110,14 @@ class WriteFileTool(Tool):
         'Arguments: {"path": "<path relative to workspace root>", "content": "<full new file content>"}'
     )
 
-    def __init__(self, confirm: Callable[[str], bool]):
+    def __init__(self, confirm: Callable[[str], bool], on_write: Callable[[str], None] | None = None):
         """`confirm` is given a human-readable preview (diff or new-file content) and
-        must return True to proceed with the write, False to abort it."""
+        must return True to proceed with the write, False to abort it. `on_write`, if
+        given, is called with the relative path after a successful write — used to
+        scope a diff summary to only what was actually touched, rather than the whole
+        working tree (which may have unrelated pre-existing uncommitted changes)."""
         self._confirm = confirm
+        self._on_write = on_write
 
     def execute(self, workspace: WorkspaceContext, arguments: dict) -> ToolResult:
         path_arg = arguments.get("path")
@@ -139,6 +143,8 @@ class WriteFileTool(Tool):
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
+        if self._on_write:
+            self._on_write(path_arg)
         return ToolResult(success=True, output=f"Wrote {len(content)} characters to {path_arg}")
 
     @staticmethod

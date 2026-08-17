@@ -42,14 +42,40 @@ def print_banner(model: ModelProvider, workspace: WorkspaceContext) -> None:
     )
 
 
-def print_plan(plan_text: str) -> None:
+DEFAULT_PLAN_NOTE = (
+    "Read-only analysis — nothing was changed. Run `skytrap` to have SkyTrap implement it."
+)
+
+
+def print_plan(plan_text: str, note: str = DEFAULT_PLAN_NOTE) -> None:
     console.print(
         Panel(plan_text, title="Architect plan", border_style="cyan", padding=(1, 2))
     )
-    console.print(
-        "[dim]Read-only analysis — nothing was changed. "
-        "Run `skytrap` to have SkyTrap implement it.[/dim]"
+    if note:
+        console.print(f"[dim]{note}[/dim]")
+
+
+def confirm_implement_plan() -> bool:
+    return Confirm.ask("Implement this plan?", default=False)
+
+
+def print_developer_summary(summary: str) -> None:
+    console.print(Panel(summary, title="Developer summary", border_style="green", padding=(1, 2)))
+
+
+def print_test_result(output: str, success: bool) -> None:
+    style = "green" if success else "red"
+    title = "Tests passed" if success else "Tests failed"
+    console.print(Panel(output, title=title, border_style=style, padding=(1, 2)))
+
+
+def print_diff_summary(diff_text: str) -> None:
+    syntax = (
+        Syntax(diff_text, "diff", theme="ansi_dark", word_wrap=True)
+        if diff_text.startswith(("---", "+++", "@@"))
+        else diff_text
     )
+    console.print(Panel(syntax, title="Diff (Reviewer)", border_style="cyan", padding=(1, 2)))
 
 
 def run_chat_loop(respond: Callable[[str], str]) -> None:
