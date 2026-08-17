@@ -4,6 +4,7 @@ from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import detect_workspace
 from skytrap.models.ollama import OllamaProvider
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool
+from skytrap.tools.git import GitDiffTool, GitStatusTool
 from skytrap.tools.search import SearchCodeTool
 from skytrap.ui.terminal import print_banner, run_chat_loop
 
@@ -17,7 +18,13 @@ def main(ctx: typer.Context) -> None:
 
     workspace = detect_workspace()
     model = OllamaProvider()
-    tools = [ReadFileTool(), ListDirectoryTool(), SearchCodeTool()]
+    tools = [
+        ReadFileTool(),
+        ListDirectoryTool(),
+        SearchCodeTool(),
+        GitStatusTool(),
+        GitDiffTool(),
+    ]
     history: list[dict] = []
 
     def respond(user_input: str) -> str:

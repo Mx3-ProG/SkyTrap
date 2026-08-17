@@ -27,6 +27,11 @@ To answer the user directly (no tool needed):
 
 Only call a tool when you genuinely need information from the workspace to answer. \
 For greetings or general questions, respond immediately with type "final".
+
+You may only ever return ONE of these two JSON shapes — never invent a different \
+"type" value, and never put more than one tool call in a single response. If a task \
+needs several tools, call the first one now; you will be given its result and can \
+call the next tool in your following response.
 """
 
 
