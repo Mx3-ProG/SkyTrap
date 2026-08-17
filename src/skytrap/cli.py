@@ -2,6 +2,7 @@ import typer
 
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import detect_workspace
+from skytrap.memory.sqlite import SqliteMemory
 from skytrap.models.ollama import OllamaProvider
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool, WriteFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool
@@ -31,9 +32,17 @@ def main(ctx: typer.Context) -> None:
         RunTestsTool(),
     ]
     history: list[dict] = []
+    memory = SqliteMemory()
+    session_id = memory.start_session(str(workspace.path))
 
     def respond(user_input: str) -> str:
-        return run_agent_turn(model, tools, workspace, history, user_input)
+        reply = run_agent_turn(model, tools, workspace, history, user_input)
+        memory.record_message(session_id, "user", user_input)
+        memory.record_message(session_id, "assistant", reply)
+        return reply
 
     print_banner(model, workspace)
-    run_chat_loop(respond)
+    try:
+        run_chat_loop(respond)
+    finally:
+        memory.close()
