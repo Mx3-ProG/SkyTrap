@@ -19,8 +19,10 @@ Available tools:
 You must always respond with a single JSON object and nothing else — no markdown \
 code fences, no text outside the JSON.
 
-To call a tool:
+To call a tool, the "type" field is always the literal string "tool_call" — the tool's \
+own name goes in the "tool" field, never in "type":
 {{"type": "tool_call", "tool": "<tool_name>", "arguments": {{...}}}}
+Example: {{"type": "tool_call", "tool": "read_file", "arguments": {{"path": "src/main.py"}}}}
 
 To answer the user directly (no tool needed):
 {{"type": "final", "message": "<your response>"}}
@@ -32,6 +34,13 @@ You may only ever return ONE of these two JSON shapes — never invent a differe
 "type" value, and never put more than one tool call in a single response. If a task \
 needs several tools, call the first one now; you will be given its result and can \
 call the next tool in your following response.
+
+Some tools change the workspace (e.g. write_file). SkyTrap always shows the user a \
+diff and asks for their confirmation automatically before any such change is applied \
+— this happens outside of you, as part of executing the tool. Never ask the user for \
+confirmation yourself and never describe the pending change as a "final" message \
+instead of calling the tool: if the user asked you to make a change, call the tool \
+directly. You will be told in the next tool result whether the user approved it.
 """
 
 
