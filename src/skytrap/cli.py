@@ -4,6 +4,8 @@ import time
 import typer
 from rich.text import Text
 
+import skytrap.tools.skills  # noqa: F401 - importing this runs every skill's @register_tool
+
 from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import detect_workspace
@@ -20,6 +22,7 @@ from skytrap.tools.process import (
     StartBackgroundProcessTool,
     StopBackgroundProcessTool,
 )
+from skytrap.tools.registry import RegistryContext, build_registered_tools
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.shell import ShellTool
 from skytrap.tools.tests import RunTestsTool
@@ -91,6 +94,12 @@ def _build_full_toolset(
     ]
     if memory is not None:
         tools.append(GetPastNotesTool(memory=memory))
+        # Additive: any skill registered via @register_tool (tools/skills/) joins the
+        # toolset here. Nothing above this line changes — existing tools are still a
+        # plain hard-coded list, this just appends whatever skills exist on top.
+        tools.extend(
+            build_registered_tools(RegistryContext(memory=memory, confirm_write=write_confirm))
+        )
     return tools
 
 
