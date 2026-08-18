@@ -4,3 +4,4 @@
 
 from skytrap.tools.skills.contract_review import tool as _contract_review_tool  # noqa: F401
 from skytrap.tools.skills.nda_triage import tool as _nda_triage_tool  # noqa: F401
+from skytrap.tools.skills.sql_queries import tool as _sql_queries_tool  # noqa: F401
