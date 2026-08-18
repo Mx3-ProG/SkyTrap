@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Callable
 
 from pydantic import ValidationError
 
@@ -153,11 +154,15 @@ def run_agent_turn(
     history: list[dict],
     user_input: str,
     role_prompt: str | None = None,
+    on_step: Callable[[dict], None] | None = None,
 ) -> str:
     """Runs one observe -> decide -> act -> observe loop until the model gives a
     final answer or MAX_STEPS is reached. `history` is mutated in place so the
     conversation carries over between turns. `role_prompt`, if given, overrides the
-    generic assistant framing (e.g. a restricted Architect role).
+    generic assistant framing (e.g. a restricted Architect role). `on_step`, if
+    given, is called after each tool result with {"tool", "arguments", "observation"}
+    — used by the web server to stream progress over a WebSocket; the CLI passes
+    None (no behavior change).
     """
     tools_by_name = {tool.name: tool for tool in tools}
     messages = [{"role": "system", "content": _build_system_prompt(workspace, tools, role_prompt)}]
@@ -181,6 +186,9 @@ def run_agent_turn(
         else:
             result = tool.execute(workspace, decision.arguments)
             observation = result.output if result.success else f"ERROR: {result.output}"
+
+        if on_step is not None:
+            on_step({"tool": decision.tool, "arguments": decision.arguments, "observation": observation})
 
         messages.append(
             {"role": "user", "content": f"Tool result for {decision.tool}:\n{observation}"}
