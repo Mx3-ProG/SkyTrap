@@ -1,4 +1,8 @@
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from skytrap.models.base import ModelProvider
 from skytrap.server.auth.email import load_email_sender
@@ -9,6 +13,13 @@ from skytrap.server.routers.turns import router as turns_router
 from skytrap.server.turns import TurnRegistry
 from skytrap.server.ws.connection import ConnectionManager
 from skytrap.server.ws.router import router as ws_router
+
+# Only the Vite dev server origin for now — this is a local-first, single-user
+# system; once a real remote deployment (Tailscale/Vercel) is in play, this list
+# grows to include that origin instead of ever using allow_origins=["*"].
+DEV_FRONTEND_ORIGINS = ["http://localhost:5173"]
+
+FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
 
 def create_app(
@@ -33,9 +44,26 @@ def create_app(
     app.state.turn_registry = TurnRegistry()
     app.state.model_provider = model_provider
 
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=DEV_FRONTEND_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     app.include_router(auth_router)
     app.include_router(turns_router)
     app.include_router(ws_router)
+
+    # Serves the built PWA (npm run build in frontend/) once it exists. Mounted
+    # last and at "/" so it only ever catches paths none of the API routers
+    # above matched — registration order is what FastAPI/Starlette use to
+    # resolve routes, so this must stay below every app.include_router() call.
+    # Guarded by existence so environments (including the test suite) that
+    # never built the frontend don't fail to start.
+    if FRONTEND_DIST.is_dir():
+        app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
 
     return app
 

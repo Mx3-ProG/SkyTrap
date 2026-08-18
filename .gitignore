@@ -7,3 +7,6 @@ dist/
 build/
 .pytest_cache/
 .DS_Store
+node_modules/
+frontend/dist/
+*.tsbuildinfo

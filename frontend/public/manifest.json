@@ -1,0 +1,17 @@
+{
+  "name": "SkyTrap",
+  "short_name": "SkyTrap",
+  "description": "Contrôle distant de SkyTrap, l'agent de code local-first",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#0a84ff",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
