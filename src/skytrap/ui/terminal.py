@@ -1,3 +1,4 @@
+import sys
 from typing import Callable, Literal
 
 from prompt_toolkit import PromptSession
@@ -186,12 +187,32 @@ def _build_key_bindings(state: ChatState) -> KeyBindings:
 
 def run_chat_loop(respond: Callable[[str, ChatState], None], state: ChatState | None = None) -> None:
     state = state or ChatState()
-    session: PromptSession = PromptSession(key_bindings=_build_key_bindings(state))
+
+    # prompt_toolkit's non-tty fallback reads the ENTIRE stdin stream on its first
+    # .prompt() call rather than one line at a time — confirmed directly: a second,
+    # unrelated read (Rich's Confirm.ask(), used by every write_file/shell/docx
+    # confirmation) then hits an immediate EOFError because the pipe is already
+    # drained. Shift+Tab is meaningless without a real interactive terminal anyway
+    # (no human pressing keys), so when stdin isn't a tty — piped input, scripts,
+    # CI — fall back to plain console.input(), which reads one line at a time and
+    # doesn't fight with Confirm.ask() over the same stream.
+    use_prompt_toolkit = sys.stdin.isatty()
+    session: PromptSession | None = (
+        PromptSession(key_bindings=_build_key_bindings(state)) if use_prompt_toolkit else None
+    )
 
     console.print()
     while True:
         try:
-            user_input = session.prompt(f"SkyTrap [{state.mode}] > ")
+            if session is not None:
+                # plain string, no markup parsing — prompt_toolkit doesn't interpret
+                # Rich's "[...]" syntax, so no escaping needed here.
+                user_input = session.prompt(f"SkyTrap [{state.mode}] > ")
+            else:
+                # console.input DOES parse Rich markup — "[normal]"/"[plan]"/"[auto]"
+                # would otherwise be silently swallowed as an (invalid) style tag,
+                # same class of bug fixed earlier for tool output containing "[...]".
+                user_input = console.input(f"SkyTrap \\[{state.mode}] > ")
         except (EOFError, KeyboardInterrupt):
             console.print()
             break
