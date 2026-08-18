@@ -4,6 +4,7 @@ from skytrap.models.base import ModelProvider
 from skytrap.tools.base import Tool
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool
+from skytrap.tools.process import ListBackgroundProcessesTool
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.verification import (
     AccessibilityCheckTool,
@@ -149,9 +150,9 @@ modified function is actually called elsewhere).
 
 If the diff touches HTML or CSS, also consider running html_lint / css_lint on the \
 changed files, and — only if a local dev server for this project is already running \
-(check git_status/the diff/task description for signs of one, or ask rather than \
-guessing a port) — lighthouse_audit / accessibility_check against it. These tools need \
-an actual running server; don't call them against a URL you're only assuming exists.
+(check with list_background_processes rather than guessing a port) — lighthouse_audit / \
+accessibility_check against it. These tools need an actual running server; don't call \
+them against a URL you're only assuming exists.
 
 Do not rewrite the code yourself — only report findings, each as a short line naming \
 the file and the concern. If tests passed and you genuinely find nothing else \
@@ -186,6 +187,7 @@ def run_reviewer(
         AccessibilityCheckTool(),
         HtmlLintTool(),
         CssLintTool(),
+        ListBackgroundProcessesTool(),
     ]
     history: list[dict] = []
     test_status = "PASSED" if tests_passed else "FAILED"

@@ -1,5 +1,10 @@
-import typer
+import shlex
+import time
 
+import typer
+from rich.text import Text
+
+from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import detect_workspace
 from skytrap.core.roles import run_architect, run_developer, run_reviewer
@@ -8,6 +13,11 @@ from skytrap.models.ollama import OllamaProvider
 from skytrap.tools.base import Tool
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool, WriteFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool, review_diff
+from skytrap.tools.process import (
+    ListBackgroundProcessesTool,
+    StartBackgroundProcessTool,
+    StopBackgroundProcessTool,
+)
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.shell import ShellTool
 from skytrap.tools.tests import RunTestsTool
@@ -20,6 +30,8 @@ from skytrap.tools.verification import (
 from skytrap.ui.terminal import (
     confirm_implement_plan,
     confirm_shell,
+    confirm_start_process,
+    confirm_stop_process,
     confirm_write,
     console,
     print_banner,
@@ -51,6 +63,9 @@ def _build_full_toolset(on_write=None) -> list[Tool]:
         AccessibilityCheckTool(),
         HtmlLintTool(),
         CssLintTool(),
+        StartBackgroundProcessTool(confirm=confirm_start_process),
+        ListBackgroundProcessesTool(),
+        StopBackgroundProcessTool(confirm=confirm_stop_process),
     ]
 
 
@@ -134,3 +149,57 @@ def build(task: str) -> None:
         model, workspace, task, diff_result.output, test_result.output, test_result.success
     )
     print_review(review)
+
+
+@app.command()
+def serve(command: str) -> None:
+    """Start COMMAND (e.g. "npm run dev") as a persistent background process that
+    keeps running after this exits. No confirmation needed — you typed the exact
+    command yourself. Use `skytrap ps` to check on it, `skytrap stop <id>` to stop it."""
+    workspace = detect_workspace()
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] could not parse command: {exc}")
+        raise typer.Exit(1) from exc
+    if not tokens:
+        console.print("[bold red]Error:[/bold red] empty command")
+        raise typer.Exit(1)
+
+    record = processes.start_process(str(workspace.path), tokens)
+    time.sleep(1)  # give it a moment to fail fast (missing deps, command not found, ...)
+
+    if not processes.is_running(record.pid):
+        console.print(f"[bold red]Process exited immediately[/bold red] (pid {record.pid})")
+        console.print(Text(processes.tail_log(record)))
+        raise typer.Exit(1)
+
+    console.print(f"[green]Started[/green] #{record.id} (pid {record.pid}): {command}")
+    console.print(f"[dim]Log: {record.log_path}[/dim]")
+
+
+@app.command()
+def ps() -> None:
+    """List tracked background processes across all workspaces."""
+    records = processes.list_processes()
+    if not records:
+        console.print("[dim]No tracked background processes.[/dim]")
+        return
+
+    for record in records:
+        line = Text()
+        line.append(f"#{record.id} ")
+        if record.running:
+            line.append("[running]", style="green")
+        else:
+            line.append("[stopped]", style="dim")
+        line.append(f" pid {record.pid}: {record.command} ({record.workspace_path})")
+        console.print(line)
+
+
+@app.command()
+def stop(process_id: int) -> None:
+    """Stop a tracked background process by id (see `skytrap ps`)."""
+    ok, message = processes.stop_process(process_id)
+    style = "green" if ok else "yellow"
+    console.print(f"[{style}]{message}[/{style}]")

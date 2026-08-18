@@ -31,6 +31,27 @@ def confirm_shell(preview: str) -> bool:
     return Confirm.ask("Run this command?", default=False)
 
 
+def confirm_start_process(preview: str) -> bool:
+    """Shows the pending background command and asks the user to approve starting it."""
+    console.print(
+        Panel(
+            Text(preview),
+            title="Start background process?",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+    )
+    return Confirm.ask("Start this process?", default=False)
+
+
+def confirm_stop_process(preview: str) -> bool:
+    """Shows the process about to be stopped and asks the user to approve it."""
+    console.print(
+        Panel(Text(preview), title="Stop background process?", border_style="yellow", padding=(1, 2))
+    )
+    return Confirm.ask("Stop this process?", default=False)
+
+
 def print_banner(model: ModelProvider, workspace: WorkspaceContext) -> None:
     branch_display = workspace.branch if workspace.is_git else "no git repo"
     body = (
