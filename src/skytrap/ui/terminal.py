@@ -4,6 +4,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.syntax import Syntax
+from rich.text import Text
 
 from skytrap.core.context import WorkspaceContext
 from skytrap.models.base import ModelProvider
@@ -15,7 +16,7 @@ def confirm_write(preview: str) -> bool:
     """Shows a diff/new-file preview and asks the user to approve a write_file call."""
     syntax = Syntax(preview, "diff", theme="ansi_dark", word_wrap=True) if preview.startswith(
         ("---", "+++", "@@")
-    ) else preview
+    ) else Text(preview)
     console.print(
         Panel(syntax, title="Proposed write", border_style="yellow", padding=(1, 2))
     )
@@ -24,7 +25,9 @@ def confirm_write(preview: str) -> bool:
 
 def confirm_shell(preview: str) -> bool:
     """Shows the pending shell command and asks the user to approve running it."""
-    console.print(Panel(preview, title="Run shell command?", border_style="yellow", padding=(1, 2)))
+    console.print(
+        Panel(Text(preview), title="Run shell command?", border_style="yellow", padding=(1, 2))
+    )
     return Confirm.ask("Run this command?", default=False)
 
 
@@ -49,7 +52,7 @@ DEFAULT_PLAN_NOTE = (
 
 def print_plan(plan_text: str, note: str = DEFAULT_PLAN_NOTE) -> None:
     console.print(
-        Panel(plan_text, title="Architect plan", border_style="cyan", padding=(1, 2))
+        Panel(Text(plan_text), title="Architect plan", border_style="cyan", padding=(1, 2))
     )
     if note:
         console.print(f"[dim]{note}[/dim]")
@@ -60,27 +63,29 @@ def confirm_implement_plan() -> bool:
 
 
 def print_developer_summary(summary: str) -> None:
-    console.print(Panel(summary, title="Developer summary", border_style="green", padding=(1, 2)))
+    console.print(
+        Panel(Text(summary), title="Developer summary", border_style="green", padding=(1, 2))
+    )
 
 
 def print_test_result(output: str, success: bool) -> None:
     style = "green" if success else "red"
     title = "Tests passed" if success else "Tests failed"
-    console.print(Panel(output, title=title, border_style=style, padding=(1, 2)))
+    console.print(Panel(Text(output), title=title, border_style=style, padding=(1, 2)))
 
 
 def print_diff_summary(diff_text: str) -> None:
     syntax = (
         Syntax(diff_text, "diff", theme="ansi_dark", word_wrap=True)
         if diff_text.startswith(("---", "+++", "@@"))
-        else diff_text
+        else Text(diff_text)
     )
     console.print(Panel(syntax, title="Diff", border_style="cyan", padding=(1, 2)))
 
 
 def print_review(review_text: str) -> None:
     console.print(
-        Panel(review_text, title="Reviewer", border_style="magenta", padding=(1, 2))
+        Panel(Text(review_text), title="Reviewer", border_style="magenta", padding=(1, 2))
     )
 
 
@@ -108,5 +113,5 @@ def run_chat_loop(respond: Callable[[str], str]) -> None:
             console.print(f"[bold red]Error:[/bold red] {exc}")
             continue
 
-        console.print(reply)
+        console.print(Text(reply))
         console.print()

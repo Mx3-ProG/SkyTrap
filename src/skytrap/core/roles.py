@@ -5,6 +5,12 @@ from skytrap.tools.base import Tool
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool
 from skytrap.tools.search import SearchCodeTool
+from skytrap.tools.verification import (
+    AccessibilityCheckTool,
+    CssLintTool,
+    HtmlLintTool,
+    LighthouseAuditTool,
+)
 
 ARCHITECT_ROLE_PROMPT = """You are acting as SkyTrap's Architect role. The user is going \
 to ask you to plan a code change. This is a completely normal, expected request — you \
@@ -141,6 +147,12 @@ quality issues (missed edge cases, dead code, mismatched naming). You have read-
 tools if you need more context than the diff alone gives you (e.g. to see how a \
 modified function is actually called elsewhere).
 
+If the diff touches HTML or CSS, also consider running html_lint / css_lint on the \
+changed files, and — only if a local dev server for this project is already running \
+(check git_status/the diff/task description for signs of one, or ask rather than \
+guessing a port) — lighthouse_audit / accessibility_check against it. These tools need \
+an actual running server; don't call them against a URL you're only assuming exists.
+
 Do not rewrite the code yourself — only report findings, each as a short line naming \
 the file and the concern. If tests passed and you genuinely find nothing else \
 significant, say so plainly ("No issues found.") — do not invent problems just to \
@@ -170,6 +182,10 @@ def run_reviewer(
         SearchCodeTool(),
         GitStatusTool(),
         GitDiffTool(),
+        LighthouseAuditTool(),
+        AccessibilityCheckTool(),
+        HtmlLintTool(),
+        CssLintTool(),
     ]
     history: list[dict] = []
     test_status = "PASSED" if tests_passed else "FAILED"

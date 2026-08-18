@@ -11,6 +11,12 @@ from skytrap.tools.git import GitDiffTool, GitStatusTool, review_diff
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.shell import ShellTool
 from skytrap.tools.tests import RunTestsTool
+from skytrap.tools.verification import (
+    AccessibilityCheckTool,
+    CssLintTool,
+    HtmlLintTool,
+    LighthouseAuditTool,
+)
 from skytrap.ui.terminal import (
     confirm_implement_plan,
     confirm_shell,
@@ -41,6 +47,10 @@ def _build_full_toolset(on_write=None) -> list[Tool]:
         WriteFileTool(confirm=confirm_write, on_write=on_write),
         ShellTool(confirm=confirm_shell),
         RunTestsTool(),
+        LighthouseAuditTool(),
+        AccessibilityCheckTool(),
+        HtmlLintTool(),
+        CssLintTool(),
     ]
 
 
