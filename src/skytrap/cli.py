@@ -306,11 +306,34 @@ def create_user(email: str) -> None:
 
 
 @app.command()
-def serve_web(host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Start the SkyTrap web control backend (FastAPI): login/OTP/refresh/logout/me
-    over plain HTTP for now — no WebSocket yet, no Tailscale/Vercel involved at
-    this stage. Distinct from `skytrap serve`, which starts an arbitrary background
-    process (e.g. a dev server) in the current workspace — same verb, different job."""
+def serve_web(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    tailscale: bool = typer.Option(
+        False,
+        "--tailscale",
+        help=(
+            "Also expose this server on your tailnet over HTTPS via `tailscale "
+            "serve`, so it's reachable from your phone anywhere — not just this "
+            "machine's local network. Requires Tailscale installed, logged in, "
+            "with MagicDNS and HTTPS Certificates enabled in the admin console."
+        ),
+    ),
+) -> None:
+    """Start the SkyTrap web control backend (FastAPI): auth, turns, WebSocket
+    streaming, and the PWA itself if built (see `frontend/`). Distinct from
+    `skytrap serve`, which starts an arbitrary background process (e.g. a dev
+    server) in the current workspace — same verb, different job."""
     import uvicorn
+
+    if tailscale:
+        from skytrap.core.tailscale import TailscaleError, enable_serve
+
+        try:
+            url = enable_serve(port)
+        except TailscaleError as exc:
+            console.print(f"[bold red]Tailscale error:[/bold red] {exc}")
+            raise typer.Exit(1) from exc
+        console.print(f"[green]Reachable on your tailnet at:[/green] {url}")
 
     uvicorn.run("skytrap.server.app:app", host=host, port=port)
