@@ -281,3 +281,36 @@ def stop(process_id: int) -> None:
     ok, message = processes.stop_process(process_id)
     style = "green" if ok else "yellow"
     console.print(f"[{style}]{message}[/{style}]")
+
+
+@app.command()
+def create_user(email: str) -> None:
+    """Create the single user account for the web control backend (login/OTP over
+    HTTP — see `skytrap serve-web`). There is no HTTP signup route on purpose: this
+    is a single-user system, AuthStore.create_user already refuses a second
+    account, so an HTTP signup endpoint would only add attack surface for nothing."""
+    from skytrap.server.auth.store import AuthStore
+
+    password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+
+    store = AuthStore()
+    try:
+        user = store.create_user(email, password)
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        store.close()
+
+    console.print(f"[green]Created user[/green] #{user.id}: {user.email}")
+
+
+@app.command()
+def serve_web(host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Start the SkyTrap web control backend (FastAPI): login/OTP/refresh/logout/me
+    over plain HTTP for now — no WebSocket yet, no Tailscale/Vercel involved at
+    this stage. Distinct from `skytrap serve`, which starts an arbitrary background
+    process (e.g. a dev server) in the current workspace — same verb, different job."""
+    import uvicorn
+
+    uvicorn.run("skytrap.server.app:app", host=host, port=port)
