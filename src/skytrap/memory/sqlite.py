@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,11 +19,30 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    workspace_path TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    tags TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class Note:
+    id: int
+    session_id: int
+    workspace_path: str
+    summary: str
+    tags: str | None
+    created_at: str
 
 
 class SqliteMemory:
@@ -52,6 +72,33 @@ class SqliteMemory:
             (session_id, role, content, _now()),
         )
         self._conn.commit()
+
+    def record_note(
+        self, session_id: int, workspace_path: str, summary: str, tags: str | None = None
+    ) -> int:
+        cursor = self._conn.execute(
+            "INSERT INTO notes (session_id, workspace_path, summary, tags, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, workspace_path, summary, tags, _now()),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def list_notes(self, workspace_path: str, limit: int = 10) -> list[Note]:
+        rows = self._conn.execute(
+            "SELECT id, session_id, workspace_path, summary, tags, created_at FROM notes "
+            "WHERE workspace_path = ? ORDER BY id DESC LIMIT ?",
+            (workspace_path, limit),
+        ).fetchall()
+        return [Note(*row) for row in rows]
+
+    def search_notes(self, workspace_path: str, query: str, limit: int = 10) -> list[Note]:
+        rows = self._conn.execute(
+            "SELECT id, session_id, workspace_path, summary, tags, created_at FROM notes "
+            "WHERE workspace_path = ? AND summary LIKE ? ORDER BY id DESC LIMIT ?",
+            (workspace_path, f"%{query}%", limit),
+        ).fetchall()
+        return [Note(*row) for row in rows]
 
     def close(self) -> None:
         self._conn.close()

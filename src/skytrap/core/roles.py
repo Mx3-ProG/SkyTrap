@@ -1,9 +1,11 @@
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext
+from skytrap.memory.sqlite import SqliteMemory
 from skytrap.models.base import ModelProvider
 from skytrap.tools.base import Tool
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool
+from skytrap.tools.notes import GetPastNotesTool
 from skytrap.tools.process import ListBackgroundProcessesTool
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.verification import (
@@ -69,7 +71,12 @@ def _looks_like_refusal(text: str) -> bool:
     return any(pattern in lowered for pattern in _REFUSAL_PATTERNS)
 
 
-def run_architect(model: ModelProvider, workspace: WorkspaceContext, task: str) -> str:
+def run_architect(
+    model: ModelProvider,
+    workspace: WorkspaceContext,
+    task: str,
+    memory: SqliteMemory | None = None,
+) -> str:
     """One-shot, read-only analysis: produces an implementation plan without touching
     the workspace. Each call is stateless (no shared history) since this is meant to be
     invoked explicitly per task, not as part of an ongoing conversation.
@@ -86,6 +93,8 @@ def run_architect(model: ModelProvider, workspace: WorkspaceContext, task: str) 
         GitStatusTool(),
         GitDiffTool(),
     ]
+    if memory is not None:
+        read_only_tools.append(GetPastNotesTool(memory=memory))
 
     for _ in range(2):
         history: list[dict] = []
@@ -169,6 +178,7 @@ def run_reviewer(
     diff_text: str,
     test_output: str,
     tests_passed: bool,
+    memory: SqliteMemory | None = None,
 ) -> str:
     """Reviews a diff already produced by the Developer role — read-only, reports
     findings without touching the workspace. `diff_text` is passed in directly (from
@@ -189,6 +199,8 @@ def run_reviewer(
         CssLintTool(),
         ListBackgroundProcessesTool(),
     ]
+    if memory is not None:
+        read_only_tools.append(GetPastNotesTool(memory=memory))
     history: list[dict] = []
     test_status = "PASSED" if tests_passed else "FAILED"
     prompt_input = (

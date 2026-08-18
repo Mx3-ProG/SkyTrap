@@ -7,12 +7,14 @@ from rich.text import Text
 from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import detect_workspace
+from skytrap.core.notes import run_summarizer
 from skytrap.core.roles import run_architect, run_developer, run_reviewer
 from skytrap.memory.sqlite import SqliteMemory
 from skytrap.models.ollama import OllamaProvider
 from skytrap.tools.base import Tool
 from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool, WriteFileTool
 from skytrap.tools.git import GitDiffTool, GitStatusTool, review_diff
+from skytrap.tools.notes import GetPastNotesTool
 from skytrap.tools.process import (
     ListBackgroundProcessesTool,
     StartBackgroundProcessTool,
@@ -48,13 +50,17 @@ from skytrap.ui.terminal import (
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 
 
-def _build_full_toolset(on_write=None, state: ChatState | None = None) -> list[Tool]:
+def _build_full_toolset(
+    on_write=None, state: ChatState | None = None, memory: SqliteMemory | None = None
+) -> list[Tool]:
     """The complete, mutating toolset: everything a chat session or the Developer
     role can call. write_file and shell each keep their own confirmation gate.
     `on_write`, if given, is forwarded to WriteFileTool to track touched paths.
     `state`, if given, makes the confirmation gates mode-aware (auto-approved with
     the preview still shown when state.mode == "auto") — the `plan`/`build` CLI
-    commands don't pass one, so they keep their normal always-confirm behavior."""
+    commands don't pass one, so they keep their normal always-confirm behavior.
+    `memory`, if given, adds get_past_notes (read-only) so the agent can reorient
+    using SkyTrap's own past work-log notes for this workspace."""
     if state is not None:
         write_confirm = make_mode_aware_confirm(confirm_write, state)
         shell_confirm = make_mode_aware_confirm(confirm_shell, state)
@@ -66,7 +72,7 @@ def _build_full_toolset(on_write=None, state: ChatState | None = None) -> list[T
         start_process_confirm = confirm_start_process
         stop_process_confirm = confirm_stop_process
 
-    return [
+    tools: list[Tool] = [
         ReadFileTool(),
         ListDirectoryTool(),
         SearchCodeTool(),
@@ -83,6 +89,9 @@ def _build_full_toolset(on_write=None, state: ChatState | None = None) -> list[T
         ListBackgroundProcessesTool(),
         StopBackgroundProcessTool(confirm=stop_process_confirm),
     ]
+    if memory is not None:
+        tools.append(GetPastNotesTool(memory=memory))
+    return tools
 
 
 @app.callback(invoke_without_command=True)
@@ -93,9 +102,10 @@ def main(ctx: typer.Context) -> None:
     workspace = detect_workspace()
     model = OllamaProvider()
     state = ChatState()
-    tools = _build_full_toolset(state=state)
-    history: list[dict] = []
     memory = SqliteMemory()
+    touched_files: list[str] = []
+    tools = _build_full_toolset(state=state, memory=memory, on_write=touched_files.append)
+    history: list[dict] = []
     session_id = memory.start_session(str(workspace.path))
 
     def respond(user_input: str, chat_state: ChatState) -> None:
@@ -120,6 +130,16 @@ def main(ctx: typer.Context) -> None:
     try:
         run_chat_loop(respond, state=state)
     finally:
+        # Only worth a note if something actually happened — not for a two-message
+        # "hi"/"hello" exchange. len(history) counts message-pairs from completed
+        # normal/auto-mode turns (plan-mode turns are intentionally stateless).
+        if len(history) >= 4 or touched_files:
+            transcript = "\n".join(f"{m['role']}: {m['content']}" for m in history)
+            try:
+                note = run_summarizer(model, workspace, "Interactive chat session", transcript)
+                memory.record_note(session_id, str(workspace.path), note)
+            except Exception:  # noqa: BLE001 - never let note-writing crash the exit path
+                pass
         memory.close()
 
 
@@ -143,41 +163,61 @@ def build(task: str) -> None:
     approving the plan up front."""
     workspace = detect_workspace()
     model = OllamaProvider()
+    memory = SqliteMemory()
+    session_id = memory.start_session(str(workspace.path))
 
-    console.print("[dim]Architect is analyzing the workspace...[/dim]")
-    plan_text = run_architect(model, workspace, task)
-    print_plan(plan_text, note="")
+    try:
+        console.print("[dim]Architect is analyzing the workspace...[/dim]")
+        plan_text = run_architect(model, workspace, task, memory=memory)
+        print_plan(plan_text, note="")
 
-    if not confirm_implement_plan():
-        console.print("[dim]Cancelled — nothing was changed.[/dim]")
-        return
+        if not confirm_implement_plan():
+            console.print("[dim]Cancelled — nothing was changed.[/dim]")
+            return
 
-    touched_files: list[str] = []
-    tools = _build_full_toolset(on_write=touched_files.append)
-    console.print("[dim]Developer is implementing the plan...[/dim]")
-    summary = run_developer(model, tools, workspace, task, plan_text)
-    print_developer_summary(summary)
+        touched_files: list[str] = []
+        tools = _build_full_toolset(on_write=touched_files.append, memory=memory)
+        console.print("[dim]Developer is implementing the plan...[/dim]")
+        summary = run_developer(model, tools, workspace, task, plan_text)
+        print_developer_summary(summary)
 
-    console.print("[dim]Running the test suite...[/dim]")
-    test_result = RunTestsTool().execute(workspace, {})
-    print_test_result(test_result.output, test_result.success)
+        console.print("[dim]Running the test suite...[/dim]")
+        test_result = RunTestsTool().execute(workspace, {})
+        print_test_result(test_result.output, test_result.success)
 
-    if not touched_files:
-        console.print("[dim]No files were written.[/dim]")
-        return
+        if not touched_files:
+            console.print("[dim]No files were written.[/dim]")
+            return
 
-    # Scoped to what the Developer actually wrote, not the whole working tree —
-    # otherwise pre-existing unrelated uncommitted changes would show up here too.
-    diff_result = review_diff(workspace, touched_files)
-    if not diff_result.success:
-        return
-    print_diff_summary(diff_result.output)
+        # Scoped to what the Developer actually wrote, not the whole working tree —
+        # otherwise pre-existing unrelated uncommitted changes would show up here too.
+        diff_result = review_diff(workspace, touched_files)
+        if not diff_result.success:
+            return
+        print_diff_summary(diff_result.output)
 
-    console.print("[dim]Reviewer is analyzing the diff...[/dim]")
-    review = run_reviewer(
-        model, workspace, task, diff_result.output, test_result.output, test_result.success
-    )
-    print_review(review)
+        console.print("[dim]Reviewer is analyzing the diff...[/dim]")
+        review = run_reviewer(
+            model,
+            workspace,
+            task,
+            diff_result.output,
+            test_result.output,
+            test_result.success,
+            memory=memory,
+        )
+        print_review(review)
+
+        # End-of-task boundary: this is where a note is genuinely worth writing —
+        # a completed build, not a cancelled or no-op one.
+        outcome = f"Developer summary:\n{summary}\n\nReviewer findings:\n{review}"
+        try:
+            note = run_summarizer(model, workspace, task, outcome)
+            memory.record_note(session_id, str(workspace.path), note)
+        except Exception:  # noqa: BLE001 - never let note-writing fail the build
+            pass
+    finally:
+        memory.close()
 
 
 @app.command()
