@@ -1,5 +1,8 @@
-from typing import Callable
+from typing import Callable, Literal
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
@@ -10,6 +13,47 @@ from skytrap.core.context import WorkspaceContext
 from skytrap.models.base import ModelProvider
 
 console = Console()
+
+ChatMode = Literal["normal", "plan", "auto"]
+MODE_CYCLE: tuple[ChatMode, ...] = ("normal", "plan", "auto")
+MODE_STYLES: dict[ChatMode, str] = {"normal": "cyan", "plan": "yellow", "auto": "green"}
+MODE_DESCRIPTIONS: dict[ChatMode, str] = {
+    "normal": "full tools, each write_file/shell asks for confirmation",
+    "plan": "read-only — Architect analyzes and plans, nothing can be changed",
+    "auto": "full tools, writes/commands run without asking (still shown)",
+}
+
+
+class ChatState:
+    """Tracks the current chat mode. Cycling it (via the Shift+Tab / Ctrl+Shift+Tab
+    key binding) only updates this — it never triggers a model call by itself; the
+    new mode only takes effect on the next message the user sends.
+    """
+
+    def __init__(self) -> None:
+        self.mode: ChatMode = "normal"
+
+    def cycle_mode(self) -> None:
+        current_index = MODE_CYCLE.index(self.mode)
+        self.mode = MODE_CYCLE[(current_index + 1) % len(MODE_CYCLE)]
+
+
+def make_mode_aware_confirm(base_confirm: Callable[[str], bool], state: ChatState) -> Callable[[str], bool]:
+    """Wraps an existing confirm_* function so that in "auto" mode it still shows the
+    preview (transparency — you see what happened) but skips the y/n prompt. In
+    "normal"/"plan" mode it behaves exactly as before. The underlying Tool objects and
+    their base confirm callbacks are untouched; only the wrapper is mode-aware.
+    """
+
+    def wrapped(preview: str) -> bool:
+        if state.mode == "auto":
+            console.print(
+                Panel(Text(preview), title="Auto-approved", border_style="green", padding=(1, 2))
+            )
+            return True
+        return base_confirm(preview)
+
+    return wrapped
 
 
 def confirm_write(preview: str) -> bool:
@@ -64,6 +108,10 @@ def print_banner(model: ModelProvider, workspace: WorkspaceContext) -> None:
     console.print(
         Panel(body, title="SKYTRAP", title_align="center", border_style="cyan", padding=(1, 2))
     )
+    console.print(
+        "[dim]Shift+Tab cycles mode: normal -> plan -> auto. "
+        "Ctrl+C interrupts a running turn.[/dim]\n"
+    )
 
 
 DEFAULT_PLAN_NOTE = (
@@ -110,11 +158,40 @@ def print_review(review_text: str) -> None:
     )
 
 
-def run_chat_loop(respond: Callable[[str], str]) -> None:
+def _build_key_bindings(state: ChatState) -> KeyBindings:
+    bindings = KeyBindings()
+
+    def announce_mode_change() -> None:
+        style = MODE_STYLES[state.mode]
+        console.print(
+            f"\n[dim]Mode ->[/dim] [bold {style}]{state.mode}[/bold {style}] "
+            f"[dim]({MODE_DESCRIPTIONS[state.mode]})[/dim]"
+        )
+
+    def cycle(_event) -> None:
+        state.cycle_mode()
+        # Printing from a key binding must go through run_in_terminal, otherwise it
+        # corrupts the active prompt's display instead of appearing cleanly above it.
+        run_in_terminal(announce_mode_change)
+
+    # "Ctrl+Shift+Tab" isn't a key prompt_toolkit's ANSI parser can represent at all —
+    # verified directly against prompt_toolkit.key_binding.key_bindings._parse_key,
+    # which raises ValueError for "c-s-tab"/"c-tab" (most terminals don't send a
+    # distinguishable escape sequence for it). Only Shift+Tab (Keys.BackTab, "s-tab")
+    # is actually parseable — which is exactly what Claude Code itself binds this to.
+    bindings.add("s-tab")(cycle)
+
+    return bindings
+
+
+def run_chat_loop(respond: Callable[[str, ChatState], None], state: ChatState | None = None) -> None:
+    state = state or ChatState()
+    session: PromptSession = PromptSession(key_bindings=_build_key_bindings(state))
+
     console.print()
     while True:
         try:
-            user_input = console.input("[bold cyan]SkyTrap >[/bold cyan] ")
+            user_input = session.prompt(f"SkyTrap [{state.mode}] > ")
         except (EOFError, KeyboardInterrupt):
             console.print()
             break
@@ -125,14 +202,15 @@ def run_chat_loop(respond: Callable[[str], str]) -> None:
         if stripped.lower() in {"exit", "quit"}:
             break
 
-        # Plain text, not a Live spinner: a tool call (e.g. write_file) may need to
-        # prompt the user interactively mid-turn, which doesn't mix with Rich's Live display.
-        console.print("[dim]thinking...[/dim]")
         try:
-            reply = respond(stripped)
+            respond(stripped, state)
+        except KeyboardInterrupt:
+            # Ctrl+C during "thinking"/tool execution — abort this turn, not the whole
+            # session. Python delivers the interrupt wherever the call currently is
+            # (including inside a blocking httpx request), so no threading/cancellation
+            # machinery is needed for this to work.
+            console.print("[yellow]Interrupted.[/yellow]")
         except Exception as exc:  # noqa: BLE001 - surface any backend failure to the user
             console.print(f"[bold red]Error:[/bold red] {exc}")
-            continue
 
-        console.print(Text(reply))
         console.print()

@@ -28,12 +28,14 @@ from skytrap.tools.verification import (
     LighthouseAuditTool,
 )
 from skytrap.ui.terminal import (
+    ChatState,
     confirm_implement_plan,
     confirm_shell,
     confirm_start_process,
     confirm_stop_process,
     confirm_write,
     console,
+    make_mode_aware_confirm,
     print_banner,
     print_developer_summary,
     print_diff_summary,
@@ -46,26 +48,40 @@ from skytrap.ui.terminal import (
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 
 
-def _build_full_toolset(on_write=None) -> list[Tool]:
+def _build_full_toolset(on_write=None, state: ChatState | None = None) -> list[Tool]:
     """The complete, mutating toolset: everything a chat session or the Developer
     role can call. write_file and shell each keep their own confirmation gate.
-    `on_write`, if given, is forwarded to WriteFileTool to track touched paths."""
+    `on_write`, if given, is forwarded to WriteFileTool to track touched paths.
+    `state`, if given, makes the confirmation gates mode-aware (auto-approved with
+    the preview still shown when state.mode == "auto") — the `plan`/`build` CLI
+    commands don't pass one, so they keep their normal always-confirm behavior."""
+    if state is not None:
+        write_confirm = make_mode_aware_confirm(confirm_write, state)
+        shell_confirm = make_mode_aware_confirm(confirm_shell, state)
+        start_process_confirm = make_mode_aware_confirm(confirm_start_process, state)
+        stop_process_confirm = make_mode_aware_confirm(confirm_stop_process, state)
+    else:
+        write_confirm = confirm_write
+        shell_confirm = confirm_shell
+        start_process_confirm = confirm_start_process
+        stop_process_confirm = confirm_stop_process
+
     return [
         ReadFileTool(),
         ListDirectoryTool(),
         SearchCodeTool(),
         GitStatusTool(),
         GitDiffTool(),
-        WriteFileTool(confirm=confirm_write, on_write=on_write),
-        ShellTool(confirm=confirm_shell),
+        WriteFileTool(confirm=write_confirm, on_write=on_write),
+        ShellTool(confirm=shell_confirm),
         RunTestsTool(),
         LighthouseAuditTool(),
         AccessibilityCheckTool(),
         HtmlLintTool(),
         CssLintTool(),
-        StartBackgroundProcessTool(confirm=confirm_start_process),
+        StartBackgroundProcessTool(confirm=start_process_confirm),
         ListBackgroundProcessesTool(),
-        StopBackgroundProcessTool(confirm=confirm_stop_process),
+        StopBackgroundProcessTool(confirm=stop_process_confirm),
     ]
 
 
@@ -76,20 +92,33 @@ def main(ctx: typer.Context) -> None:
 
     workspace = detect_workspace()
     model = OllamaProvider()
-    tools = _build_full_toolset()
+    state = ChatState()
+    tools = _build_full_toolset(state=state)
     history: list[dict] = []
     memory = SqliteMemory()
     session_id = memory.start_session(str(workspace.path))
 
-    def respond(user_input: str) -> str:
+    def respond(user_input: str, chat_state: ChatState) -> None:
+        if chat_state.mode == "plan":
+            console.print("[dim]Architect is analyzing (read-only)...[/dim]")
+            result = run_architect(model, workspace, user_input)
+            memory.record_message(session_id, "user", user_input)
+            memory.record_message(session_id, "assistant", result)
+            print_plan(
+                result,
+                note="Read-only — nothing changed. Cycle mode (Shift+Tab) to implement.",
+            )
+            return
+
+        console.print("[dim]thinking...[/dim]")
         reply = run_agent_turn(model, tools, workspace, history, user_input)
         memory.record_message(session_id, "user", user_input)
         memory.record_message(session_id, "assistant", reply)
-        return reply
+        console.print(Text(reply))
 
     print_banner(model, workspace)
     try:
-        run_chat_loop(respond)
+        run_chat_loop(respond, state=state)
     finally:
         memory.close()
 
