@@ -1,29 +1,29 @@
 from skytrap.tools.verification import (
     _summarize_axe_report,
     _summarize_lighthouse_report,
-    _validate_local_url,
+    validate_local_url,
 )
 
 
 def test_validate_local_url_accepts_localhost():
-    ok, error = _validate_local_url("http://localhost:3000/")
+    ok, error = validate_local_url("http://localhost:3000/")
     assert ok
     assert error == ""
 
 
 def test_validate_local_url_accepts_127_0_0_1():
-    ok, _ = _validate_local_url("http://127.0.0.1:8080")
+    ok, _ = validate_local_url("http://127.0.0.1:8080")
     assert ok
 
 
 def test_validate_local_url_rejects_external_host():
-    ok, error = _validate_local_url("https://example.com")
+    ok, error = validate_local_url("https://example.com")
     assert not ok
     assert "localhost" in error
 
 
 def test_validate_local_url_rejects_bad_scheme():
-    ok, error = _validate_local_url("ftp://localhost")
+    ok, error = validate_local_url("ftp://localhost")
     assert not ok
     assert "http" in error
 

@@ -13,7 +13,7 @@ AUDIT_TIMEOUT_SECONDS = 120
 MAX_FAILING_AUDITS = 10
 
 
-def _validate_local_url(url: str) -> tuple[bool, str]:
+def validate_local_url(url: str) -> tuple[bool, str]:
     """Restricts audits to a local dev server. Without this, an audit tool with no
     confirmation gate (SAFE) would let the model probe arbitrary network hosts —
     the same reasoning as the workspace path sandbox, applied to URLs.
@@ -43,7 +43,7 @@ class LighthouseAuditTool(Tool):
         if not url:
             return ToolResult(success=False, output="Missing required argument 'url'")
 
-        ok, error = _validate_local_url(url)
+        ok, error = validate_local_url(url)
         if not ok:
             return ToolResult(success=False, output=error)
 
@@ -130,7 +130,7 @@ class AccessibilityCheckTool(Tool):
         if not url:
             return ToolResult(success=False, output="Missing required argument 'url'")
 
-        ok, error = _validate_local_url(url)
+        ok, error = validate_local_url(url)
         if not ok:
             return ToolResult(success=False, output=error)
 
