@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from skytrap.core.context import detect_workspace
 from skytrap.memory.sqlite import SqliteMemory
 from skytrap.models.ollama import OllamaProvider
-from skytrap.server.agent_worker import build_server_toolset, run_turn_in_background
+from skytrap.server.agent_worker import run_server_task
 from skytrap.server.auth.dependencies import get_current_user_id
 
 router = APIRouter(tags=["turns"])
@@ -39,14 +39,14 @@ def create_turn(
         # the same thread — created here (inside the worker thread itself), not in
         # the request handler, otherwise sqlite3 raises ProgrammingError.
         memory = SqliteMemory()
-        tools = build_server_toolset(bridge, memory=memory)
+        session_id = memory.start_session(str(workspace.path))
         try:
 
             def on_progress(step: dict) -> None:
                 connection_manager.send_from_worker_thread({"type": "turn_progress", "turn_id": turn.id, **step})
 
-            run_turn_in_background(
-                turn.id, payload.task, model, tools, workspace, registry, on_progress
+            run_server_task(
+                turn.id, payload.task, model, workspace, registry, on_progress, bridge, memory, session_id
             )
         finally:
             final = registry.get(turn.id)

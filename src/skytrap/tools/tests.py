@@ -1,8 +1,9 @@
-import json
 import shlex
 import subprocess
 
 from skytrap.core.context import WorkspaceContext
+from skytrap.core.language_detection import detect_languages
+from skytrap.core.project_inspection import resolve_commands
 from skytrap.tools.base import Tool, ToolResult
 
 TIMEOUT_SECONDS = 120
@@ -10,31 +11,27 @@ MAX_OUTPUT_CHARS = 4000
 
 
 def _detect_command(workspace: WorkspaceContext) -> str | None:
-    root = workspace.path
-
-    if (root / "pyproject.toml").exists():
-        return "uv run pytest"
-    if (root / "pytest.ini").exists() or (root / "setup.cfg").exists():
-        return "pytest"
-
-    package_json = root / "package.json"
-    if package_json.exists():
-        try:
-            data = json.loads(package_json.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return None
-        if "test" in data.get("scripts", {}):
-            return "npm test"
-
+    """Picks the test command from the highest-confidence detected language (manifest
+    match beats bare file-extension count) via the LanguageProfile registry —
+    project-appropriate for Python/JS/TS/Rust/Go/C/C++/C#/Ruby instead of a
+    hardcoded pytest-or-npm guess. Falls through languages in detection order until
+    one actually has a test command to offer (e.g. a Rust workspace with no test
+    files yet has nothing to run)."""
+    for match in detect_languages(workspace):
+        for command in resolve_commands(workspace, match).test_commands:
+            if command:
+                return command
     return None
 
 
 class RunTestsTool(Tool):
     name = "run_tests"
     description = (
-        "Run the project's test suite. Auto-detects pytest (pyproject.toml/pytest.ini/"
-        "setup.cfg) or `npm test` (package.json with a 'test' script). Always safe to "
-        "run without confirmation — it only reads and executes tests, never mutates "
+        "Run the project's test suite. Auto-detects the right command from the "
+        "workspace's language/build files (pytest, npm/pnpm/yarn/bun test, cargo "
+        "test, go test, dotnet test, rspec/rails test, ctest/make test — whichever "
+        "the detected language and its manifest indicate). Always safe to run "
+        "without confirmation — it only reads and executes tests, never mutates "
         "the workspace. "
         'Arguments: {"command": "<optional explicit test command, overrides detection>"}'
     )
@@ -45,9 +42,8 @@ class RunTestsTool(Tool):
             return ToolResult(
                 success=False,
                 output=(
-                    "Could not detect a test runner (no pyproject.toml/pytest.ini/"
-                    "setup.cfg and no package.json with a 'test' script). Pass an "
-                    "explicit 'command' argument."
+                    "Could not detect a test runner for any language found in this "
+                    "workspace. Pass an explicit 'command' argument."
                 ),
             )
 

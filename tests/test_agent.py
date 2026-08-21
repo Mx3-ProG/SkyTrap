@@ -1,9 +1,27 @@
-from skytrap.core.agent import _build_system_prompt, _load_project_instructions, _parse_decision
+import json
+
+from skytrap.core.agent import _build_system_prompt, _load_project_instructions, _parse_decision, run_agent_turn
 from skytrap.core.context import WorkspaceContext
+from skytrap.core.project_notes import append_journal_entry
+from skytrap.models.base import ModelProvider
 
 
 def _workspace(tmp_path):
     return WorkspaceContext(path=tmp_path, name=tmp_path.name, is_git=False)
+
+
+class _CountingModel(ModelProvider):
+    """Never gives a final answer — used to exercise the max_steps cutoff."""
+
+    name = "counting"
+    engine = "LOCAL"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages: list[dict]) -> str:
+        self.calls += 1
+        return json.dumps({"type": "tool_call", "tool": "nonexistent", "arguments": {}})
 
 
 def test_load_project_instructions_absent(tmp_path):
@@ -25,6 +43,20 @@ def test_system_prompt_includes_project_instructions(tmp_path):
 def test_system_prompt_omits_section_when_no_instructions_file(tmp_path):
     prompt = _build_system_prompt(_workspace(tmp_path), [])
     assert "MANDATORY PROJECT RULES" not in prompt
+
+
+def test_system_prompt_includes_journal_continuity_notes(tmp_path):
+    workspace = _workspace(tmp_path)
+    append_journal_entry(workspace, "Previous task", "Implemented the previous task in foo.py.")
+
+    prompt = _build_system_prompt(workspace, [])
+    assert "CONTINUITY NOTES" in prompt
+    assert "Implemented the previous task in foo.py." in prompt
+
+
+def test_system_prompt_omits_continuity_notes_when_no_journal(tmp_path):
+    prompt = _build_system_prompt(_workspace(tmp_path), [])
+    assert "CONTINUITY NOTES" not in prompt
 
 
 def test_parse_decision_valid_json():
@@ -55,6 +87,18 @@ def test_parse_decision_falls_back_to_raw_text_on_garbage():
     decision = _parse_decision("not json at all")
     assert decision.type == "final"
     assert decision.message == "not json at all"
+
+
+def test_run_agent_turn_respects_custom_max_steps(tmp_path):
+    model = _CountingModel()
+    run_agent_turn(model, [], _workspace(tmp_path), [], "do something", max_steps=3)
+    assert model.calls == 3
+
+
+def test_run_agent_turn_defaults_to_five_steps(tmp_path):
+    model = _CountingModel()
+    run_agent_turn(model, [], _workspace(tmp_path), [], "do something")
+    assert model.calls == 5
 
 
 def test_parse_decision_repairs_unescaped_quotes_in_final_message():

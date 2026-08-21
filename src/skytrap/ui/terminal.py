@@ -8,9 +8,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 from skytrap.core.context import WorkspaceContext
+from skytrap.core.project_inspection import ProjectProfile
 from skytrap.models.base import ModelProvider
 
 console = Console()
@@ -19,10 +21,15 @@ ChatMode = Literal["normal", "plan", "auto"]
 MODE_CYCLE: tuple[ChatMode, ...] = ("normal", "plan", "auto")
 MODE_STYLES: dict[ChatMode, str] = {"normal": "cyan", "plan": "yellow", "auto": "green"}
 MODE_DESCRIPTIONS: dict[ChatMode, str] = {
-    "normal": "full tools, each write_file/shell asks for confirmation",
+    "normal": "safe actions run immediately; installs/scripts ask first; destructive actions (rm, git reset/push, secrets) always ask",
     "plan": "read-only — Architect analyzes and plans, nothing can be changed",
-    "auto": "full tools, writes/commands run without asking (still shown)",
+    "auto": "safe + medium-risk actions run immediately; destructive actions (rm, git reset/push, secrets) still always ask",
 }
+
+SUCCESS = "✓"
+ERROR = "✗"
+WARNING = "⚠"
+ACTION = "●"
 
 
 class ChatState:
@@ -68,6 +75,14 @@ def confirm_write(preview: str) -> bool:
     return Confirm.ask("Apply this write?", default=False)
 
 
+def confirm_delete(preview: str) -> bool:
+    """Shows a file-deletion preview and asks the user to approve a delete_file call."""
+    console.print(
+        Panel(Text(preview), title="Proposed deletion", border_style="red", padding=(1, 2))
+    )
+    return Confirm.ask("Delete this file?", default=False)
+
+
 def confirm_shell(preview: str) -> bool:
     """Shows the pending shell command and asks the user to approve running it."""
     console.print(
@@ -95,6 +110,48 @@ def confirm_stop_process(preview: str) -> bool:
         Panel(Text(preview), title="Stop background process?", border_style="yellow", padding=(1, 2))
     )
     return Confirm.ask("Stop this process?", default=False)
+
+
+def print_commands(rows: list[tuple[str, str]]) -> None:
+    """Lists every registered CLI subcommand (name + one-line help), for `skytrap
+    commands` — the plain `skytrap --help` Typer already provides, rendered to match
+    the rest of SkyTrap's terminal output instead of Click's default formatting."""
+    table = Table(title="SkyTrap commands", border_style="cyan", show_lines=False)
+    table.add_column("Command", style="bold cyan", no_wrap=True)
+    table.add_column("Description", style="white")
+    for name, help_text in rows:
+        table.add_row(f"skytrap {name}", help_text)
+    console.print(table)
+    console.print(
+        "[dim]Run `skytrap` with no command to start the interactive chat. "
+        "`skytrap <command> --help` shows full details for one command.[/dim]"
+    )
+
+
+def print_project_detected(profile: ProjectProfile) -> None:
+    """The item-20-style "PROJECT DETECTED" panel — languages by real file-count
+    share and which of their toolchains are actually on PATH, not a guess."""
+    if not profile.languages:
+        console.print("[dim]No recognized language detected in this workspace.[/dim]")
+        return
+
+    lines = ["[bold]Languages[/bold]"]
+    for match in profile.languages:
+        marker = " [dim](manifest)[/dim]" if match.manifest_detected else ""
+        lines.append(f"  {match.profile.name:<12} {match.percentage:>5.1f}%{marker}")
+
+    relevant_tools = sorted(
+        {exe for m in profile.languages for exe in m.profile.toolchain_executables}
+    )
+    if relevant_tools:
+        lines.append("")
+        lines.append("[bold]Toolchain[/bold]")
+        for name in relevant_tools:
+            found = profile.toolchain.get(name)
+            mark = f"[green]{SUCCESS}[/green]" if found else f"[red]{ERROR}[/red]"
+            lines.append(f"  {mark} {name}")
+
+    console.print(Panel("\n".join(lines), title="Project detected", border_style="cyan", padding=(1, 2)))
 
 
 def print_banner(model: ModelProvider, workspace: WorkspaceContext) -> None:
@@ -157,6 +214,44 @@ def print_review(review_text: str) -> None:
     console.print(
         Panel(Text(review_text), title="Reviewer", border_style="magenta", padding=(1, 2))
     )
+
+
+def log_step(message: str, index: int | None = None, total: int | None = None) -> None:
+    """Marks a real phase transition (Architect analyzing, Developer implementing,
+    running tests, ...) — every call here corresponds to an operation actually about
+    to happen, never a fabricated progress indicator."""
+    prefix = f"[{index}/{total}] " if index is not None and total is not None else f"{ACTION} "
+    console.print(f"[cyan]{prefix}{message}[/cyan]")
+
+
+_FILE_ACTION_STYLES = {"A": "green", "M": "yellow", "D": "red"}
+
+
+def log_file(path: str, action: Literal["A", "M", "D"]) -> None:
+    """Announces a file that was actually created/modified/deleted on disk."""
+    style = _FILE_ACTION_STYLES[action]
+    console.print(f"[{style}]{action}[/{style}]  {path}")
+
+
+def print_task_report(
+    created: list[str], modified: list[str], test_success: bool | None, summary: str
+) -> None:
+    """Terse end-of-task report: what was actually created/modified and whether
+    validation actually ran and passed — no line here is printed unless the
+    corresponding operation genuinely happened."""
+    lines = [f"[bold green]{SUCCESS} TASK COMPLETED[/bold green]", ""]
+    if created:
+        lines.append("[bold]Created:[/bold]")
+        lines.extend(f"  [green]A[/green] {path}" for path in created)
+    if modified:
+        lines.append("[bold]Modified:[/bold]")
+        lines.extend(f"  [yellow]M[/yellow] {path}" for path in modified)
+    if test_success is not None:
+        style, mark, label = ("green", SUCCESS, "Tests passed") if test_success else ("red", ERROR, "Tests failed")
+        lines.append(f"[{style}]{mark} {label}[/{style}]")
+    lines.append("")
+    lines.append(summary)
+    console.print(Panel("\n".join(lines), title="Result", border_style="cyan", padding=(1, 2)))
 
 
 def _build_key_bindings(state: ChatState) -> KeyBindings:

@@ -1,105 +1,31 @@
-import re
 import shlex
 import subprocess
-from typing import Callable, Literal
+from typing import Callable
 
 from skytrap.core.context import WorkspaceContext
+from skytrap.core.tool_safety import classify_command  # noqa: F401 - re-exported for callers/tests
 from skytrap.tools.base import Tool, ToolResult
 
 TIMEOUT_SECONDS = 60
-
-FORBIDDEN_PATTERNS = [
-    r"\bsudo\b",
-    r"\brm\s+-rf\s+/(\s|$)",
-    r"\bdiskutil\b",
-    r"\bshutdown\b",
-    r"\breboot\b",
-    r"\bhalt\b",
-    r"\bmkfs\b",
-    r"\bdd\s+if=",
-]
-
-SAFE_PREFIXES = [
-    ("ls",),
-    ("pwd",),
-    ("cat",),
-    ("find",),
-    ("grep",),
-    ("rg",),
-    ("wc",),
-    ("head",),
-    ("tail",),
-    ("which",),
-    ("echo",),
-    ("git", "status"),
-    ("git", "diff"),
-    ("git", "log"),
-    ("git", "branch"),
-    ("git", "show"),
-    ("npm", "test"),
-    ("npm", "run", "test"),
-    ("yarn", "test"),
-    ("pytest",),
-    ("python", "-m", "pytest"),
-    ("python3", "-m", "pytest"),
-]
-
-CONFIRM_PREFIXES = [
-    ("npm", "install"),
-    ("npm", "ci"),
-    ("npm", "run"),
-    ("yarn", "install"),
-    ("pip", "install"),
-    ("uv", "pip", "install"),
-    ("git", "commit"),
-    ("git", "checkout"),
-    ("git", "reset"),
-    ("git", "push"),
-    ("git", "merge"),
-    ("git", "rebase"),
-    ("git", "add"),
-    ("rm",),
-    ("mv",),
-    ("python",),
-    ("python3",),
-    ("node",),
-]
-
-Classification = Literal["SAFE", "CONFIRM", "FORBIDDEN"]
-
-
-def classify_command(command: str) -> Classification:
-    if any(re.search(pattern, command) for pattern in FORBIDDEN_PATTERNS):
-        return "FORBIDDEN"
-
-    try:
-        tokens = tuple(shlex.split(command))
-    except ValueError:
-        return "CONFIRM"  # unparsable quoting — don't guess, ask the user
-
-    for prefix in SAFE_PREFIXES:
-        if tokens[: len(prefix)] == prefix:
-            return "SAFE"
-
-    for prefix in CONFIRM_PREFIXES:
-        if tokens[: len(prefix)] == prefix:
-            return "CONFIRM"
-
-    # Unknown command: default to the safer choice, not silent execution.
-    return "CONFIRM"
 
 
 class ShellTool(Tool):
     name = "shell"
     description = (
         "Run a shell command inside the workspace root. Commands are classified "
-        "SAFE (runs immediately), CONFIRM (asks the user first), or FORBIDDEN "
+        "SAFE (runs immediately), CONFIRM (asks first, auto-approved in auto mode), "
+        "DESTRUCTIVE (always asks, e.g. git reset/push/checkout, rm, mv), or FORBIDDEN "
         "(refused). Shell pipes/redirects are not supported — one plain command only. "
         'Arguments: {"command": "<command>"}'
     )
 
-    def __init__(self, confirm: Callable[[str], bool]):
+    def __init__(self, confirm: Callable[[str], bool], confirm_destructive: Callable[[str], bool] | None = None):
+        """`confirm` is used for CONFIRM-tier commands (mode-aware — may be
+        auto-approved). `confirm_destructive`, if given, is used for DESTRUCTIVE-tier
+        commands instead and should always ask regardless of mode; defaults to
+        `confirm` when not given (so existing single-callback callers keep working)."""
         self._confirm = confirm
+        self._confirm_destructive = confirm_destructive or confirm
 
     def execute(self, workspace: WorkspaceContext, arguments: dict) -> ToolResult:
         command = arguments.get("command")
@@ -110,9 +36,10 @@ class ShellTool(Tool):
         if classification == "FORBIDDEN":
             return ToolResult(success=False, output=f"Command blocked (forbidden): {command}")
 
-        if classification == "CONFIRM":
+        if classification in ("CONFIRM", "DESTRUCTIVE"):
             preview = f"Workspace: {workspace.path}\nCommand:   {command}"
-            if not self._confirm(preview):
+            confirm = self._confirm_destructive if classification == "DESTRUCTIVE" else self._confirm
+            if not confirm(preview):
                 return ToolResult(success=False, output="User declined to run this command.")
 
         try:

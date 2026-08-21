@@ -5,6 +5,8 @@ from typing import Callable
 from pydantic import ValidationError
 
 from skytrap.core.context import WorkspaceContext
+from skytrap.core.project_inspection import inspect_project, resolve_commands
+from skytrap.core.project_notes import load_recent_journal
 from skytrap.core.protocol import Decision
 from skytrap.core.repo_map import build_repo_map
 from skytrap.models.base import ModelProvider
@@ -21,6 +23,15 @@ Workspace root: {workspace_path}
 Workspace file structure (for orientation — read_file/list_directory still show \
 actual content, this is just a map):
 {repo_map}
+
+{language_summary}
+Write idiomatic code for whichever language a file is in — never port patterns from \
+one language into another (no JavaScript-style callbacks in Rust, no Java-style \
+boilerplate in Go, etc). Use the check/build/test/format/lint commands listed above \
+for the relevant language instead of inventing your own; if a project already has a \
+build system (CMake, Make, an existing package.json script, ...) use it rather than \
+a hand-written compile line. Call inspect_project if you need this for a part of the \
+repository not covered above (e.g. a monorepo subdirectory in a different language).
 
 Available tools:
 {tools_description}
@@ -44,12 +55,19 @@ You may only ever return ONE of these two JSON shapes — never invent a differe
 needs several tools, call the first one now; you will be given its result and can \
 call the next tool in your following response.
 
-Some tools change the workspace (e.g. write_file). SkyTrap always shows the user a \
-diff and asks for their confirmation automatically before any such change is applied \
-— this happens outside of you, as part of executing the tool. Never ask the user for \
-confirmation yourself and never describe the pending change as a "final" message \
-instead of calling the tool: if the user asked you to make a change, call the tool \
-directly. You will be told in the next tool result whether the user approved it.
+Some tools change the workspace (e.g. write_file). Ordinary changes apply immediately; \
+only genuinely risky ones (secrets/credentials files, git reset/push/checkout, rm, mv) \
+show the user a diff and ask for their confirmation automatically — this happens \
+outside of you, as part of executing the tool. Never ask the user for confirmation \
+yourself and never describe the pending change as a "final" message instead of \
+calling the tool: if the user asked you to make a change, call the tool directly. You \
+will be told in the next tool result whether the user approved it.
+
+If a tool result is an error — including a failing test, lint, or build command — \
+diagnose the cause yourself from the error text and try again with a fix in your next \
+tool call. Do not stop to ask the user what to do. Never end a turn by only asking \
+whether you should proceed when you already have enough information to act — call \
+the tool.
 """
 
 
@@ -66,6 +84,37 @@ def _load_project_instructions(workspace: WorkspaceContext) -> str | None:
     return content[:MAX_INSTRUCTIONS_CHARS] or None
 
 
+def _build_language_summary(workspace: WorkspaceContext) -> str:
+    """A compact per-language cheat sheet — real percentages/toolchain status from
+    inspect_project(), not a description the model has to trust blindly."""
+    profile = inspect_project(workspace)
+    if not profile.languages:
+        return "No recognized programming language detected in this workspace yet."
+
+    lines = ["Languages detected in this workspace:"]
+    for match in profile.languages[:5]:  # cap: monorepos can match many languages
+        commands = resolve_commands(workspace, match)
+        available = [
+            exe for exe in match.profile.toolchain_executables if profile.toolchain.get(exe)
+        ]
+        lines.append(
+            f"- {match.profile.name} ({match.percentage}% of source files"
+            f"{', manifest found' if match.manifest_detected else ''})"
+        )
+        if available:
+            lines.append(f"    installed toolchain: {', '.join(available)}")
+        for label, values in (
+            ("check", (commands.check_command,) if commands.check_command else ()),
+            ("build", commands.build_commands),
+            ("test", commands.test_commands),
+            ("format", commands.format_commands),
+            ("lint", commands.lint_commands),
+        ):
+            if values:
+                lines.append(f"    {label}: {' | '.join(v for v in values if v)}")
+    return "\n".join(lines)
+
+
 def _build_system_prompt(
     workspace: WorkspaceContext, tools: list[Tool], role_prompt: str | None = None
 ) -> str:
@@ -73,6 +122,7 @@ def _build_system_prompt(
     prompt = SYSTEM_PROMPT_TEMPLATE.format(
         workspace_path=workspace.path,
         repo_map=build_repo_map(workspace),
+        language_summary=_build_language_summary(workspace),
         tools_description=tools_description or "(none)",
     )
 
@@ -91,6 +141,21 @@ def _build_system_prompt(
             "Only call a tool when you genuinely need",
             f"{marker}\n{instructions}\n\nThese rules apply to every response you give in this "
             f"workspace, without exception.\n\nOnly call a tool when you genuinely need",
+        )
+
+    journal = load_recent_journal(workspace)
+    if journal:
+        # Placed after SKYTRAP.md (user-authored rules stay highest priority) but
+        # still before the tool-use instructions, for the same salience reason.
+        # This is the agent's own memory of past sessions on this project — how it
+        # "picks the thread back up" instead of starting from zero every turn.
+        journal_marker = (
+            "CONTINUITY NOTES (from Skytrap/JOURNAL.md — your own summaries of past "
+            "sessions on this project; use read_file on the full path for older history):"
+        )
+        prompt = prompt.replace(
+            "Only call a tool when you genuinely need",
+            f"{journal_marker}\n{journal}\n\nOnly call a tool when you genuinely need",
         )
 
     return prompt
@@ -155,21 +220,25 @@ def run_agent_turn(
     user_input: str,
     role_prompt: str | None = None,
     on_step: Callable[[dict], None] | None = None,
+    max_steps: int = MAX_STEPS,
 ) -> str:
     """Runs one observe -> decide -> act -> observe loop until the model gives a
-    final answer or MAX_STEPS is reached. `history` is mutated in place so the
+    final answer or `max_steps` is reached. `history` is mutated in place so the
     conversation carries over between turns. `role_prompt`, if given, overrides the
     generic assistant framing (e.g. a restricted Architect role). `on_step`, if
     given, is called after each tool result with {"tool", "arguments", "observation"}
     — used by the web server to stream progress over a WebSocket; the CLI passes
-    None (no behavior change).
+    None (no behavior change). `max_steps` defaults to MAX_STEPS (5), which suits
+    the short read-only/no-tools roles (Architect, Reviewer, Summarizer); the
+    Developer role — which routinely needs to read a few files, write/delete one or
+    more, and run tests — is given a higher budget by its caller.
     """
     tools_by_name = {tool.name: tool for tool in tools}
     messages = [{"role": "system", "content": _build_system_prompt(workspace, tools, role_prompt)}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_input})
 
-    for _ in range(MAX_STEPS):
+    for _ in range(max_steps):
         raw = model.chat(messages)
         decision = _parse_decision(raw)
         messages.append({"role": "assistant", "content": raw})

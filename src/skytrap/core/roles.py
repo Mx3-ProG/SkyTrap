@@ -1,3 +1,5 @@
+from typing import Callable
+
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext
 from skytrap.memory.sqlite import SqliteMemory
@@ -76,6 +78,7 @@ def run_architect(
     workspace: WorkspaceContext,
     task: str,
     memory: SqliteMemory | None = None,
+    on_step: Callable[[dict], None] | None = None,
 ) -> str:
     """One-shot, read-only analysis: produces an implementation plan without touching
     the workspace. Each call is stateless (no shared history) since this is meant to be
@@ -99,7 +102,13 @@ def run_architect(
     for _ in range(2):
         history: list[dict] = []
         result = run_agent_turn(
-            model, read_only_tools, workspace, history, task, role_prompt=ARCHITECT_ROLE_PROMPT
+            model,
+            read_only_tools,
+            workspace,
+            history,
+            task,
+            role_prompt=ARCHITECT_ROLE_PROMPT,
+            on_step=on_step,
         )
         if not _looks_like_refusal(result):
             return result
@@ -129,17 +138,36 @@ When you have implemented the plan, respond with type "final" and briefly summar
 what you changed (which files, what for) — not a restatement of the plan."""
 
 
+DEVELOPER_MAX_STEPS = 12
+
+
 def run_developer(
-    model: ModelProvider, tools: list[Tool], workspace: WorkspaceContext, task: str, plan: str
+    model: ModelProvider,
+    tools: list[Tool],
+    workspace: WorkspaceContext,
+    task: str,
+    plan: str,
+    max_steps: int = DEVELOPER_MAX_STEPS,
+    on_step: Callable[[dict], None] | None = None,
 ) -> str:
     """Implements a plan produced by run_architect, using the full (mutating) toolset
     the caller passes in. Each write_file/shell call still goes through its own
     confirmation gate — this role doesn't bypass that, it just decides what to call.
+    Defaults to a higher step budget than the other roles (DEVELOPER_MAX_STEPS=12,
+    vs. run_agent_turn's own default of 5) since a real task routinely needs several
+    reads plus one or more writes/deletes plus a test run.
     """
     history: list[dict] = []
     augmented_task = f"{task}\n\nImplementation plan to follow:\n{plan}"
     return run_agent_turn(
-        model, tools, workspace, history, augmented_task, role_prompt=DEVELOPER_ROLE_PROMPT
+        model,
+        tools,
+        workspace,
+        history,
+        augmented_task,
+        role_prompt=DEVELOPER_ROLE_PROMPT,
+        max_steps=max_steps,
+        on_step=on_step,
     )
 
 
@@ -179,6 +207,7 @@ def run_reviewer(
     test_output: str,
     tests_passed: bool,
     memory: SqliteMemory | None = None,
+    on_step: Callable[[dict], None] | None = None,
 ) -> str:
     """Reviews a diff already produced by the Developer role — read-only, reports
     findings without touching the workspace. `diff_text` is passed in directly (from
@@ -209,5 +238,11 @@ def run_reviewer(
         f"Test suite result ({test_status}):\n{test_output}"
     )
     return run_agent_turn(
-        model, read_only_tools, workspace, history, prompt_input, role_prompt=REVIEWER_ROLE_PROMPT
+        model,
+        read_only_tools,
+        workspace,
+        history,
+        prompt_input,
+        role_prompt=REVIEWER_ROLE_PROMPT,
+        on_step=on_step,
     )

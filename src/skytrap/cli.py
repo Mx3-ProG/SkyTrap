@@ -8,20 +8,24 @@ import skytrap.tools.skills  # noqa: F401 - importing this runs every skill's @r
 
 from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
-from skytrap.core.context import detect_workspace
+from skytrap.core.context import WorkspaceContext, detect_workspace
 from skytrap.core.notes import run_summarizer
-from skytrap.core.roles import run_architect, run_developer, run_reviewer
+from skytrap.core.project_inspection import inspect_project
+from skytrap.core.project_notes import append_journal_entry
+from skytrap.core.roles import DEVELOPER_MAX_STEPS, run_architect, run_developer, run_reviewer
 from skytrap.memory.sqlite import SqliteMemory
 from skytrap.models.ollama import OllamaProvider
+from skytrap.security.cli import security_app
 from skytrap.tools.base import Tool
-from skytrap.tools.filesystem import ListDirectoryTool, ReadFileTool, WriteFileTool
-from skytrap.tools.git import GitDiffTool, GitStatusTool, review_diff
+from skytrap.tools.filesystem import DeleteFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool
+from skytrap.tools.git import GitDiffTool, GitStatusTool, git_file_action, review_diff
 from skytrap.tools.notes import GetPastNotesTool
 from skytrap.tools.process import (
     ListBackgroundProcessesTool,
     StartBackgroundProcessTool,
     StopBackgroundProcessTool,
 )
+from skytrap.tools.project import InspectProjectTool
 from skytrap.tools.registry import RegistryContext, build_registered_tools
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.shell import ShellTool
@@ -34,46 +38,79 @@ from skytrap.tools.verification import (
 )
 from skytrap.ui.terminal import (
     ChatState,
+    confirm_delete,
     confirm_implement_plan,
     confirm_shell,
     confirm_start_process,
     confirm_stop_process,
     confirm_write,
     console,
+    log_file,
+    log_step,
     make_mode_aware_confirm,
     print_banner,
     print_developer_summary,
     print_diff_summary,
     print_plan,
+    print_commands,
+    print_project_detected,
     print_review,
+    print_task_report,
     print_test_result,
     run_chat_loop,
 )
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
+app.add_typer(security_app, name="security")
+
+MAX_AUTOFIX_ATTEMPTS = 3
 
 
 def _build_full_toolset(
-    on_write=None, state: ChatState | None = None, memory: SqliteMemory | None = None
+    workspace: WorkspaceContext,
+    on_write=None,
+    on_delete=None,
+    state: ChatState | None = None,
+    memory: SqliteMemory | None = None,
 ) -> list[Tool]:
     """The complete, mutating toolset: everything a chat session or the Developer
-    role can call. write_file and shell each keep their own confirmation gate.
-    `on_write`, if given, is forwarded to WriteFileTool to track touched paths.
-    `state`, if given, makes the confirmation gates mode-aware (auto-approved with
-    the preview still shown when state.mode == "auto") — the `plan`/`build` CLI
-    commands don't pass one, so they keep their normal always-confirm behavior.
+    role can call. Each tool classifies its own call as SAFE/CONFIRM/DESTRUCTIVE
+    (see core.tool_safety) and only consults a confirm callback for CONFIRM/
+    DESTRUCTIVE — SAFE calls (an ordinary write_file/delete_file, a SAFE-classified
+    shell command) just happen, no prompt. `on_write`, if given, is forwarded to
+    WriteFileTool to track touched paths. `state`, if given, makes the CONFIRM-tier
+    gates mode-aware (auto-approved with the preview still shown when
+    state.mode == "auto") — DESTRUCTIVE-tier gates are never mode-wrapped, so they
+    always ask regardless of mode. The `plan`/`build` CLI commands don't pass a
+    `state`, so they keep their normal always-confirm behavior for both tiers.
     `memory`, if given, adds get_past_notes (read-only) so the agent can reorient
     using SkyTrap's own past work-log notes for this workspace."""
     if state is not None:
-        write_confirm = make_mode_aware_confirm(confirm_write, state)
         shell_confirm = make_mode_aware_confirm(confirm_shell, state)
         start_process_confirm = make_mode_aware_confirm(confirm_start_process, state)
         stop_process_confirm = make_mode_aware_confirm(confirm_stop_process, state)
     else:
-        write_confirm = confirm_write
         shell_confirm = confirm_shell
         start_process_confirm = confirm_start_process
         stop_process_confirm = confirm_stop_process
+
+    # write_file/delete_file only ever consult their confirm callback for a
+    # DESTRUCTIVE-classified path (secrets/credentials) — that tier always asks, so
+    # these are deliberately the raw (non mode-wrapped) confirm functions, not
+    # affected by state.mode. Same for shell's destructive tier (rm, git reset/push).
+    on_write_logged = None
+    if on_write is not None:
+
+        def on_write_logged(path: str) -> None:  # noqa: F811 - intentional shadow
+            log_file(path, git_file_action(workspace, path))
+            on_write(path)
+
+    on_delete_logged = None
+    if on_delete is not None:
+
+        def on_delete_logged(path: str) -> None:  # noqa: F811 - intentional shadow
+            log_file(path, "D")
+            on_delete(path)
 
     tools: list[Tool] = [
         ReadFileTool(),
@@ -81,8 +118,10 @@ def _build_full_toolset(
         SearchCodeTool(),
         GitStatusTool(),
         GitDiffTool(),
-        WriteFileTool(confirm=write_confirm, on_write=on_write),
-        ShellTool(confirm=shell_confirm),
+        InspectProjectTool(),
+        WriteFileTool(confirm=confirm_write, on_write=on_write_logged),
+        DeleteFileTool(confirm=confirm_delete, on_delete=on_delete_logged),
+        ShellTool(confirm=shell_confirm, confirm_destructive=confirm_shell),
         RunTestsTool(),
         LighthouseAuditTool(),
         AccessibilityCheckTool(),
@@ -98,7 +137,7 @@ def _build_full_toolset(
         # toolset here. Nothing above this line changes — existing tools are still a
         # plain hard-coded list, this just appends whatever skills exist on top.
         tools.extend(
-            build_registered_tools(RegistryContext(memory=memory, confirm_write=write_confirm))
+            build_registered_tools(RegistryContext(memory=memory, confirm_write=confirm_write))
         )
     return tools
 
@@ -113,13 +152,15 @@ def main(ctx: typer.Context) -> None:
     state = ChatState()
     memory = SqliteMemory()
     touched_files: list[str] = []
-    tools = _build_full_toolset(state=state, memory=memory, on_write=touched_files.append)
+    tools = _build_full_toolset(
+        workspace, state=state, memory=memory, on_write=touched_files.append, on_delete=touched_files.append
+    )
     history: list[dict] = []
     session_id = memory.start_session(str(workspace.path))
 
     def respond(user_input: str, chat_state: ChatState) -> None:
         if chat_state.mode == "plan":
-            console.print("[dim]Architect is analyzing (read-only)...[/dim]")
+            log_step("Architect is analyzing (read-only)...")
             result = run_architect(model, workspace, user_input)
             memory.record_message(session_id, "user", user_input)
             memory.record_message(session_id, "assistant", result)
@@ -129,13 +170,16 @@ def main(ctx: typer.Context) -> None:
             )
             return
 
-        console.print("[dim]thinking...[/dim]")
-        reply = run_agent_turn(model, tools, workspace, history, user_input)
+        log_step("Working...")
+        reply = run_agent_turn(
+            model, tools, workspace, history, user_input, max_steps=DEVELOPER_MAX_STEPS
+        )
         memory.record_message(session_id, "user", user_input)
         memory.record_message(session_id, "assistant", reply)
         console.print(Text(reply))
 
     print_banner(model, workspace)
+    print_project_detected(inspect_project(workspace))
     try:
         run_chat_loop(respond, state=state)
     finally:
@@ -147,9 +191,21 @@ def main(ctx: typer.Context) -> None:
             try:
                 note = run_summarizer(model, workspace, "Interactive chat session", transcript)
                 memory.record_note(session_id, str(workspace.path), note)
+                append_journal_entry(workspace, "Interactive chat session", note)
             except Exception:  # noqa: BLE001 - never let note-writing crash the exit path
                 pass
         memory.close()
+
+
+@app.command()
+def commands() -> None:
+    """List every available `skytrap` command with a one-line description."""
+    click_command = typer.main.get_command(app)
+    rows = [
+        (name, sub.get_short_help_str(80))
+        for name, sub in sorted(click_command.commands.items())
+    ]
+    print_commands(rows)
 
 
 @app.command()
@@ -159,7 +215,7 @@ def plan(task: str) -> None:
     nothing in the workspace is changed."""
     workspace = detect_workspace()
     model = OllamaProvider()
-    console.print("[dim]Architect is analyzing the workspace...[/dim]")
+    log_step("Architect is analyzing the workspace...")
     result = run_architect(model, workspace, task)
     print_plan(result)
 
@@ -176,7 +232,8 @@ def build(task: str) -> None:
     session_id = memory.start_session(str(workspace.path))
 
     try:
-        console.print("[dim]Architect is analyzing the workspace...[/dim]")
+        print_project_detected(inspect_project(workspace))
+        log_step("Architect is analyzing the workspace...")
         plan_text = run_architect(model, workspace, task, memory=memory)
         print_plan(plan_text, note="")
 
@@ -185,13 +242,30 @@ def build(task: str) -> None:
             return
 
         touched_files: list[str] = []
-        tools = _build_full_toolset(on_write=touched_files.append, memory=memory)
-        console.print("[dim]Developer is implementing the plan...[/dim]")
-        summary = run_developer(model, tools, workspace, task, plan_text)
-        print_developer_summary(summary)
+        tools = _build_full_toolset(
+            workspace, on_write=touched_files.append, on_delete=touched_files.append, memory=memory
+        )
 
-        console.print("[dim]Running the test suite...[/dim]")
-        test_result = RunTestsTool().execute(workspace, {})
+        current_task = task
+        for attempt in range(1, MAX_AUTOFIX_ATTEMPTS + 1):
+            log_step(f"Developer is implementing the plan... ({attempt}/{MAX_AUTOFIX_ATTEMPTS})")
+            summary = run_developer(model, tools, workspace, current_task, plan_text)
+
+            log_step("Running the test suite...")
+            test_result = RunTestsTool().execute(workspace, {})
+
+            if test_result.success or attempt == MAX_AUTOFIX_ATTEMPTS:
+                break
+            console.print(
+                f"[yellow]⚠ Tests failed — diagnosing and retrying "
+                f"({attempt}/{MAX_AUTOFIX_ATTEMPTS})...[/yellow]"
+            )
+            current_task = (
+                f"{task}\n\nAttempt {attempt} failed the test suite:\n{test_result.output}\n"
+                "Fix the code so the tests pass."
+            )
+
+        print_developer_summary(summary)
         print_test_result(test_result.output, test_result.success)
 
         if not touched_files:
@@ -205,7 +279,7 @@ def build(task: str) -> None:
             return
         print_diff_summary(diff_result.output)
 
-        console.print("[dim]Reviewer is analyzing the diff...[/dim]")
+        log_step("Reviewer is analyzing the diff...")
         review = run_reviewer(
             model,
             workspace,
@@ -217,12 +291,17 @@ def build(task: str) -> None:
         )
         print_review(review)
 
+        created = [p for p in touched_files if git_file_action(workspace, p) == "A"]
+        modified = [p for p in touched_files if p not in created]
+        print_task_report(created, modified, test_result.success, summary)
+
         # End-of-task boundary: this is where a note is genuinely worth writing —
         # a completed build, not a cancelled or no-op one.
         outcome = f"Developer summary:\n{summary}\n\nReviewer findings:\n{review}"
         try:
             note = run_summarizer(model, workspace, task, outcome)
             memory.record_note(session_id, str(workspace.path), note)
+            append_journal_entry(workspace, task, note)
         except Exception:  # noqa: BLE001 - never let note-writing fail the build
             pass
     finally:

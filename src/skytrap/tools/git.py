@@ -25,6 +25,19 @@ def _run_git(args: list[str], workspace: WorkspaceContext) -> ToolResult:
     return ToolResult(success=True, output=result.stdout)
 
 
+def git_file_action(workspace: WorkspaceContext, path: str) -> str:
+    """Whether `path` is newly untracked ("A") or an edit to an already-tracked file
+    ("M"), per `git status --porcelain`. Used to log an accurate A/M tag right after a
+    write_file call. Defaults to "M" for non-git workspaces or on any git error —
+    it's just a display hint, never load-bearing."""
+    if not workspace.is_git:
+        return "M"
+    result = _run_git(["status", "--porcelain", "--", path], workspace)
+    if result.success and result.output.strip().startswith("??"):
+        return "A"
+    return "M"
+
+
 class GitStatusTool(Tool):
     name = "git_status"
     description = (
