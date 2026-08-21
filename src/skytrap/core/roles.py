@@ -168,6 +168,7 @@ def run_developer(
         role_prompt=DEVELOPER_ROLE_PROMPT,
         max_steps=max_steps,
         on_step=on_step,
+        require_execution_evidence=True,
     )
 
 

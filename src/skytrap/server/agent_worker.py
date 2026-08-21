@@ -19,6 +19,7 @@ from skytrap.tools.process import (
 )
 from skytrap.tools.project import InspectProjectTool
 from skytrap.tools.search import SearchCodeTool
+from skytrap.tools.security import SecurityAuditTool
 from skytrap.tools.shell import ShellTool
 from skytrap.tools.tests import RunTestsTool
 
@@ -47,6 +48,7 @@ def build_server_toolset(
         GitStatusTool(),
         GitDiffTool(),
         InspectProjectTool(),
+        SecurityAuditTool(),
         WriteFileTool(confirm=lambda preview: bridge.request(preview, "write"), on_write=on_write),
         DeleteFileTool(confirm=lambda preview: bridge.request(preview, "delete")),
         ShellTool(confirm=lambda preview: bridge.request(preview, "shell")),

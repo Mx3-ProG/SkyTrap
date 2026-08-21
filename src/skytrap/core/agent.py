@@ -5,6 +5,7 @@ from typing import Callable
 from pydantic import ValidationError
 
 from skytrap.core.context import WorkspaceContext
+from skytrap.core.intent import looks_like_consultant_refusal
 from skytrap.core.project_inspection import inspect_project, resolve_commands
 from skytrap.core.project_notes import load_recent_journal
 from skytrap.core.protocol import Decision
@@ -15,6 +16,15 @@ from skytrap.tools.base import Tool
 MAX_STEPS = 5
 MAX_INSTRUCTIONS_CHARS = 20_000
 INSTRUCTIONS_FILENAME = "SKYTRAP.md"
+MAX_EXECUTION_REJECTIONS = 2
+MUTATING_TOOL_NAMES = {"write_file", "delete_file", "shell"}
+
+EXECUTION_NUDGE = (
+    "You are in execution mode. The user requested implementation, not advice. You "
+    "have filesystem and command-execution tools listed above — use them now. Stop "
+    "explaining and perform the next concrete step (create/edit a file, or run a "
+    "command)."
+)
 
 SYSTEM_PROMPT_TEMPLATE = """You are SkyTrap, a local coding assistant running in a terminal.
 
@@ -68,6 +78,13 @@ diagnose the cause yourself from the error text and try again with a fix in your
 tool call. Do not stop to ask the user what to do. Never end a turn by only asking \
 whether you should proceed when you already have enough information to act — call \
 the tool.
+
+A request to implement, program, build, create a project, or continue a previously \
+agreed plan is an execution request, not a request for advice. Never respond with an \
+explanation of how the change could be made, a code snippet with no corresponding \
+write_file call, or a statement that the project is too large to build, when \
+write_file/shell are in your tool list above — call them. A large task is not a \
+reason to stop; break it into the next concrete file/command and keep going.
 """
 
 
@@ -221,6 +238,7 @@ def run_agent_turn(
     role_prompt: str | None = None,
     on_step: Callable[[dict], None] | None = None,
     max_steps: int = MAX_STEPS,
+    require_execution_evidence: bool = False,
 ) -> str:
     """Runs one observe -> decide -> act -> observe loop until the model gives a
     final answer or `max_steps` is reached. `history` is mutated in place so the
@@ -232,11 +250,25 @@ def run_agent_turn(
     the short read-only/no-tools roles (Architect, Reviewer, Summarizer); the
     Developer role — which routinely needs to read a few files, write/delete one or
     more, and run tests — is given a higher budget by its caller.
+
+    `require_execution_evidence`, when True, refuses to accept a "final" answer
+    that made zero mutating tool calls (write_file/delete_file/shell) AND reads as
+    consultant-style hedging (looks_like_consultant_refusal) — the caller has
+    determined this turn is an implementation request, so a tool-free "here's how
+    you could do it" is never a valid completion. A tool-free final that is NOT a
+    hedge (e.g. "no code change is needed for this question") is still accepted —
+    the guard targets the specific reported failure mode, not every answer that
+    happens not to touch a file. Instead of returning, a nudge is appended and the
+    loop continues, up to MAX_EXECUTION_REJECTIONS times; beyond that the model's
+    own message is returned as-is (a real capability gap, not infinite retry).
     """
     tools_by_name = {tool.name: tool for tool in tools}
     messages = [{"role": "system", "content": _build_system_prompt(workspace, tools, role_prompt)}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_input})
+
+    mutating_calls_made = 0
+    rejections = 0
 
     for _ in range(max_steps):
         raw = model.chat(messages)
@@ -245,6 +277,16 @@ def run_agent_turn(
 
         if decision.type == "final":
             final_message = decision.message or raw
+            needs_rejection = (
+                require_execution_evidence
+                and mutating_calls_made == 0
+                and looks_like_consultant_refusal(final_message)
+                and rejections < MAX_EXECUTION_REJECTIONS
+            )
+            if needs_rejection:
+                rejections += 1
+                messages.append({"role": "system", "content": EXECUTION_NUDGE})
+                continue
             history.append({"role": "user", "content": user_input})
             history.append({"role": "assistant", "content": final_message})
             return final_message
@@ -255,6 +297,8 @@ def run_agent_turn(
         else:
             result = tool.execute(workspace, decision.arguments)
             observation = result.output if result.success else f"ERROR: {result.output}"
+            if result.success and decision.tool in MUTATING_TOOL_NAMES:
+                mutating_calls_made += 1
 
         if on_step is not None:
             on_step({"tool": decision.tool, "arguments": decision.arguments, "observation": observation})

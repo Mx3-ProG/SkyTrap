@@ -4,6 +4,7 @@ from skytrap.core.agent import _build_system_prompt, _load_project_instructions,
 from skytrap.core.context import WorkspaceContext
 from skytrap.core.project_notes import append_journal_entry
 from skytrap.models.base import ModelProvider
+from skytrap.tools.base import Tool, ToolResult
 
 
 def _workspace(tmp_path):
@@ -99,6 +100,104 @@ def test_run_agent_turn_defaults_to_five_steps(tmp_path):
     model = _CountingModel()
     run_agent_turn(model, [], _workspace(tmp_path), [], "do something")
     assert model.calls == 5
+
+
+class _ScriptedModel(ModelProvider):
+    """Replays a fixed sequence of raw responses, one per call."""
+
+    name = "scripted"
+    engine = "LOCAL"
+
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    def chat(self, messages: list[dict]) -> str:
+        raw = self._responses[self.calls]
+        self.calls += 1
+        return raw
+
+
+class _FakeWriteFileTool(Tool):
+    name = "write_file"
+    description = "test double"
+
+    def execute(self, workspace, arguments) -> ToolResult:
+        return ToolResult(success=True, output="wrote it")
+
+
+def _final(message: str) -> str:
+    return json.dumps({"type": "final", "message": message})
+
+
+def test_execution_guard_rejects_hedge_and_accepts_after_real_write(tmp_path):
+    model = _ScriptedModel(
+        [
+            _final("I cannot create an entire project, but I can show you how."),
+            json.dumps({"type": "tool_call", "tool": "write_file", "arguments": {"path": "a.py", "content": "x"}}),
+            _final("Created a.py."),
+        ]
+    )
+    result = run_agent_turn(
+        model,
+        [_FakeWriteFileTool()],
+        _workspace(tmp_path),
+        [],
+        "Programme ce projet.",
+        max_steps=10,
+        require_execution_evidence=True,
+    )
+    assert result == "Created a.py."
+    assert model.calls == 3
+
+
+def test_execution_guard_gives_up_after_max_rejections(tmp_path):
+    model = _ScriptedModel(
+        [
+            _final("I cannot create an entire project, but I can show you how."),
+            _final("I can show you how, but I cannot build it myself."),
+            _final("I can show you how, but I cannot build it myself."),
+        ]
+    )
+    result = run_agent_turn(
+        model,
+        [],
+        _workspace(tmp_path),
+        [],
+        "Programme ce projet.",
+        max_steps=10,
+        require_execution_evidence=True,
+    )
+    # Accepted on the 3rd attempt: 2 rejections consumed, cap reached.
+    assert result == "I can show you how, but I cannot build it myself."
+    assert model.calls == 3
+
+
+def test_execution_guard_accepts_legitimate_zero_tool_answer(tmp_path):
+    # A tool-free final that isn't a hedge (e.g. "nothing to change") must be
+    # accepted immediately — the guard targets hedging, not the absence of a tool
+    # call by itself.
+    model = _ScriptedModel([_final("No changes needed — this can be answered directly.")])
+    result = run_agent_turn(
+        model,
+        [],
+        _workspace(tmp_path),
+        [],
+        "Programme ce projet.",
+        max_steps=10,
+        require_execution_evidence=True,
+    )
+    assert result == "No changes needed — this can be answered directly."
+    assert model.calls == 1
+
+
+def test_execution_guard_inactive_when_not_required(tmp_path):
+    model = _ScriptedModel([_final("I cannot create an entire project, but I can show you how.")])
+    result = run_agent_turn(
+        model, [], _workspace(tmp_path), [], "Explique-moi ce fichier.", max_steps=10
+    )
+    assert result == "I cannot create an entire project, but I can show you how."
+    assert model.calls == 1
 
 
 def test_parse_decision_repairs_unescaped_quotes_in_final_message():

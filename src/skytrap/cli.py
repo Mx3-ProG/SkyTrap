@@ -9,6 +9,7 @@ import skytrap.tools.skills  # noqa: F401 - importing this runs every skill's @r
 from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext, detect_workspace
+from skytrap.core.intent import detect_execution_intent
 from skytrap.core.notes import run_summarizer
 from skytrap.core.project_inspection import inspect_project
 from skytrap.core.project_notes import append_journal_entry
@@ -28,6 +29,7 @@ from skytrap.tools.process import (
 from skytrap.tools.project import InspectProjectTool
 from skytrap.tools.registry import RegistryContext, build_registered_tools
 from skytrap.tools.search import SearchCodeTool
+from skytrap.tools.security import SecurityAuditTool
 from skytrap.tools.shell import ShellTool
 from skytrap.tools.tests import RunTestsTool
 from skytrap.tools.verification import (
@@ -119,6 +121,7 @@ def _build_full_toolset(
         GitStatusTool(),
         GitDiffTool(),
         InspectProjectTool(),
+        SecurityAuditTool(),
         WriteFileTool(confirm=confirm_write, on_write=on_write_logged),
         DeleteFileTool(confirm=confirm_delete, on_delete=on_delete_logged),
         ShellTool(confirm=shell_confirm, confirm_destructive=confirm_shell),
@@ -157,11 +160,51 @@ def main(ctx: typer.Context) -> None:
     )
     history: list[dict] = []
     session_id = memory.start_session(str(workspace.path))
+    # Set whenever plan mode produces a plan, consumed if the very next message is
+    # an execution trigger ("Go.", "Implémente le plan.") — otherwise plan-mode
+    # turns carry no memory at all (they're excluded from `history`), so "Go." would
+    # go right back to the read-only Architect with no idea what plan it just gave.
+    last_plan: list[str] = []
+
+    def on_step(step: dict) -> None:
+        tool = step.get("tool")
+        if tool == "write_file":
+            path = (step.get("arguments") or {}).get("path")
+            if path:
+                log_file(path, git_file_action(workspace, path))
+        elif tool == "delete_file":
+            path = (step.get("arguments") or {}).get("path")
+            if path:
+                log_file(path, "D")
+        elif tool:
+            log_step(f"{tool} {step.get('arguments') or ''}".strip())
 
     def respond(user_input: str, chat_state: ChatState) -> None:
+        execute_intent = detect_execution_intent(user_input)
+
+        if chat_state.mode == "plan" and execute_intent and last_plan:
+            log_step("Executing the previously agreed plan...")
+            augmented_input = f"{user_input}\n\nPreviously agreed plan:\n{last_plan[0]}"
+            reply = run_agent_turn(
+                model,
+                tools,
+                workspace,
+                history,
+                augmented_input,
+                max_steps=DEVELOPER_MAX_STEPS,
+                require_execution_evidence=True,
+                on_step=on_step,
+            )
+            memory.record_message(session_id, "user", user_input)
+            memory.record_message(session_id, "assistant", reply)
+            console.print(Text(reply))
+            console.print("[dim](executed the agreed plan — mode is still \"plan\"; Shift+Tab to change it)[/dim]")
+            return
+
         if chat_state.mode == "plan":
             log_step("Architect is analyzing (read-only)...")
             result = run_architect(model, workspace, user_input)
+            last_plan[:] = [result]
             memory.record_message(session_id, "user", user_input)
             memory.record_message(session_id, "assistant", result)
             print_plan(
@@ -172,7 +215,14 @@ def main(ctx: typer.Context) -> None:
 
         log_step("Working...")
         reply = run_agent_turn(
-            model, tools, workspace, history, user_input, max_steps=DEVELOPER_MAX_STEPS
+            model,
+            tools,
+            workspace,
+            history,
+            user_input,
+            max_steps=DEVELOPER_MAX_STEPS,
+            require_execution_evidence=execute_intent,
+            on_step=on_step,
         )
         memory.record_message(session_id, "user", user_input)
         memory.record_message(session_id, "assistant", reply)
