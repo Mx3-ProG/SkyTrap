@@ -4,11 +4,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from skytrap.core.projects import ProjectStore
 from skytrap.models.base import ModelProvider
 from skytrap.server.auth.email import load_email_sender
 from skytrap.server.auth.router import router as auth_router
 from skytrap.server.auth.store import AuthStore
 from skytrap.server.config import Settings, load_settings
+from skytrap.server.routers.projects import router as projects_router
 from skytrap.server.routers.turns import router as turns_router
 from skytrap.server.turns import TurnRegistry
 from skytrap.server.ws.connection import ConnectionManager
@@ -26,6 +28,7 @@ def create_app(
     settings: Settings | None = None,
     auth_store: AuthStore | None = None,
     model_provider: ModelProvider | None = None,
+    project_store: ProjectStore | None = None,
 ) -> FastAPI:
     """Assembles shared dependencies (settings, the auth store, the email sender,
     the connection manager, the turn registry, and optionally the model provider)
@@ -43,6 +46,7 @@ def create_app(
     app.state.connection_manager = ConnectionManager()
     app.state.turn_registry = TurnRegistry()
     app.state.model_provider = model_provider
+    app.state.project_store = project_store or ProjectStore()
 
     app.add_middleware(
         CORSMiddleware,
@@ -54,6 +58,7 @@ def create_app(
 
     app.include_router(auth_router)
     app.include_router(turns_router)
+    app.include_router(projects_router)
     app.include_router(ws_router)
 
     # Serves the built PWA (npm run build in frontend/) once it exists. Mounted
