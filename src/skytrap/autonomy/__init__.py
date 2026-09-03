@@ -1,6 +1,8 @@
 """Persistent local autonomous-agent runtime."""
 
 from skytrap.autonomy.approval import ApprovalDecision, ApprovalEngine, ApprovalRequest
+from skytrap.autonomy.browser_verification import BrowserCapabilityReport, BrowserCapabilityStatus, BrowserVerificationProvider, BrowserVerificationResult
+from skytrap.autonomy.evidence import ExecutionEvidence
 from skytrap.autonomy.executor import ToolExecutor
 from skytrap.autonomy.git_workflow import GitWorkflow
 from skytrap.autonomy.intent import (
@@ -15,6 +17,7 @@ from skytrap.autonomy.memory import TaskStore, WorkingMemory
 from skytrap.autonomy.patching import PatchEngine
 from skytrap.autonomy.planning import PlanStep, Planner, TaskPlan
 from skytrap.autonomy.risk import Capability, RiskAssessment, RiskEngine, RiskLevel
+from skytrap.autonomy.review import IndependentReviewer, ReviewFinding, ReviewResult, ReviewSeverity
 from skytrap.autonomy.service import AutonomousTaskService
 from skytrap.autonomy.state import TaskState, TaskStatus
 from skytrap.autonomy.verification import VerificationLoop, VerificationResult, VerificationStage
@@ -28,7 +31,12 @@ __all__ = [
     "ApprovalRequest",
     "Capability",
     "BuildTool",
+    "BrowserVerificationProvider",
+    "BrowserVerificationResult",
+    "BrowserCapabilityReport",
+    "BrowserCapabilityStatus",
     "GitWorkflow",
+    "ExecutionEvidence",
     "HumanIntentEngine",
     "IntentContext",
     "IntentMessage",
@@ -43,6 +51,10 @@ __all__ = [
     "RiskAssessment",
     "RiskEngine",
     "RiskLevel",
+    "IndependentReviewer",
+    "ReviewFinding",
+    "ReviewResult",
+    "ReviewSeverity",
     "TaskPlan",
     "TaskState",
     "TaskStatus",

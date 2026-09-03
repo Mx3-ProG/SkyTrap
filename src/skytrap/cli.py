@@ -7,12 +7,16 @@ from rich.text import Text
 
 import skytrap.tools.skills  # noqa: F401 - importing this runs every skill's @register_tool
 
-from skytrap.autonomy.approval import ApprovalRequest
+from skytrap.autonomy.approval import ApprovalEngine, ApprovalRequest
+from skytrap.autonomy.executor import ToolExecutor
+from skytrap.autonomy.memory import WorkingMemory
+from skytrap.autonomy.risk import FULL_INTERACTIVE_CAPABILITIES, RiskEngine, RiskLevel
 from skytrap.autonomy.service import AutonomousTaskService
 from skytrap.autonomy.state import TaskState, TaskStatus
 from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext, detect_workspace, git_worktree_state
+from skytrap.core.doctor import DEGRADED, HEALTHY, build_fix_plan, intelligence_health_report, run_doctor
 from skytrap.core.intent import detect_execution_intent
 from skytrap.core.notes import run_summarizer
 from skytrap.core.project_inspection import inspect_project
@@ -20,6 +24,7 @@ from skytrap.core.project_notes import append_journal_entry
 from skytrap.core.roles import DEVELOPER_MAX_STEPS, run_architect, run_developer, run_reviewer
 from skytrap.memory.sqlite import SqliteMemory
 from skytrap.models.ollama import OllamaProvider
+from skytrap.models.router import configured_ollama_router
 from skytrap.security.cli import security_app
 from skytrap.tools.base import Tool
 from skytrap.tools.filesystem import DeleteFileTool, ListDirectoryTool, ReadFileTool, WriteFileTool
@@ -35,6 +40,7 @@ from skytrap.tools.registry import RegistryContext, build_registered_tools
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.security import SecurityAuditTool
 from skytrap.tools.shell import ShellTool
+from skytrap.tools.structural_search import StructuralSearchTool
 from skytrap.tools.tests import RunTestsTool
 from skytrap.tools.verification import (
     AccessibilityCheckTool,
@@ -45,17 +51,11 @@ from skytrap.tools.verification import (
 from skytrap.ui.terminal import (
     AgentRenderer,
     ChatState,
-    confirm_delete,
     confirm_implement_plan,
-    confirm_shell,
-    confirm_start_process,
-    confirm_stop_process,
-    confirm_write,
     console,
     generate_command_map,
     log_file,
     log_step,
-    make_mode_aware_confirm,
     print_agent_event,
     print_command_map,
     print_developer_summary,
@@ -72,26 +72,31 @@ from skytrap.ui.terminal import (
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
 agent_app = typer.Typer(help="Run and manage persistent autonomous coding tasks.")
+update_app = typer.Typer(help="Inspect trusted technology and model update sources.")
 app.add_typer(security_app, name="security")
 app.add_typer(agent_app, name="agent")
+app.add_typer(update_app, name="update")
 
 MAX_AUTOFIX_ATTEMPTS = 3
 
 
-def _approve_autonomous_action(request: ApprovalRequest, renderer: AgentRenderer) -> bool:
+def _approval_action_label(request: ApprovalRequest) -> str:
     safe_arguments = {
         key: value
         for key, value in request.arguments.items()
         if key not in {"content", "replacement", "expected"}
     }
-    action = str(
+    return str(
         safe_arguments.get("command")
         or safe_arguments.get("path")
         or f"{request.tool_name} {safe_arguments}"
     )
+
+
+def _approve_autonomous_action(request: ApprovalRequest, renderer: AgentRenderer) -> bool:
     renderer.render_risk_prompt(
         request.assessment.level.name,
-        action,
+        _approval_action_label(request),
         request.assessment.capability.value,
     )
     if request.assessment.reasons:
@@ -114,12 +119,14 @@ def _print_autonomous_result(task: TaskState) -> None:
 
 def _autonomous_service(*, full_diff: bool = False) -> AutonomousTaskService:
     renderer = AgentRenderer(full_diff=full_diff)
+    provider = OllamaProvider()
 
     def approval_callback(request: ApprovalRequest) -> bool:
         return _approve_autonomous_action(request, renderer)
 
     return AutonomousTaskService(
-        OllamaProvider(),
+        provider,
+        model_router=configured_ollama_router(provider),
         approval_callback=approval_callback,
         on_event=renderer.handle_event,
     )
@@ -152,7 +159,7 @@ def agent_resume(
         False, "--full-diff", help="Show every diff in full, without collapsing unchanged context lines."
     ),
 ) -> None:
-    """Resume a persisted interrupted, failed, blocked, or approval-paused task."""
+    """Resume a persisted task, optionally answering a pending clarification."""
     service = _autonomous_service(full_diff=full_diff)
     try:
         task = service.resume(task_id, clarification=answer)
@@ -212,38 +219,33 @@ def agent_rollback(task_id: str) -> None:
     console.print(f"[green]Rolled back {task.task_branch} to {task.base_commit}.[/green]")
 
 
+def _always_approve(_preview: str) -> bool:
+    """Item 1 — UNIFY EXECUTION: every mutating tool built by `_build_full_toolset`
+    is wired with an always-approve `confirm`, matching
+    `skytrap.autonomy.tools.build_autonomous_tools`'s convention exactly. A tool's
+    own `confirm` callback is no longer a second, independent approval gate — the
+    single gate is `ToolExecutor`'s RiskEngine + ApprovalEngine, which every write
+    path (interactive chat, `skytrap build`, the web server, and `skytrap agent
+    run`) now goes through identically. Wiring a real per-tool confirm here again
+    would silently create a second policy and is exactly what this unification
+    removes."""
+    return True
+
+
 def _build_full_toolset(
     workspace: WorkspaceContext,
     on_write=None,
     on_delete=None,
-    state: ChatState | None = None,
     memory: SqliteMemory | None = None,
 ) -> list[Tool]:
     """The complete, mutating toolset: everything a chat session or the Developer
-    role can call. Each tool classifies its own call as SAFE/CONFIRM/DESTRUCTIVE
-    (see core.tool_safety) and only consults a confirm callback for CONFIRM/
-    DESTRUCTIVE — SAFE calls (an ordinary write_file/delete_file, a SAFE-classified
-    shell command) just happen, no prompt. `on_write`, if given, is forwarded to
-    WriteFileTool to track touched paths. `state`, if given, makes the CONFIRM-tier
-    gates mode-aware (auto-approved with the preview still shown when
-    state.mode == "auto") — DESTRUCTIVE-tier gates are never mode-wrapped, so they
-    always ask regardless of mode. The `plan`/`build` CLI commands don't pass a
-    `state`, so they keep their normal always-confirm behavior for both tiers.
-    `memory`, if given, adds get_past_notes (read-only) so the agent can reorient
-    using SkyTrap's own past work-log notes for this workspace."""
-    if state is not None:
-        shell_confirm = make_mode_aware_confirm(confirm_shell, state)
-        start_process_confirm = make_mode_aware_confirm(confirm_start_process, state)
-        stop_process_confirm = make_mode_aware_confirm(confirm_stop_process, state)
-    else:
-        shell_confirm = confirm_shell
-        start_process_confirm = confirm_start_process
-        stop_process_confirm = confirm_stop_process
-
-    # write_file/delete_file only ever consult their confirm callback for a
-    # DESTRUCTIVE-classified path (secrets/credentials) — that tier always asks, so
-    # these are deliberately the raw (non mode-wrapped) confirm functions, not
-    # affected by state.mode. Same for shell's destructive tier (rm, git reset/push).
+    role can call. Every tool here is built with an always-approve `confirm` — the
+    single approval boundary is the `ToolExecutor` (RiskEngine + ApprovalEngine)
+    the caller wraps this list in (see `_build_full_executor` / `run_developer`),
+    not a per-tool policy. `on_write`, if given, is forwarded to WriteFileTool to
+    track touched paths. `memory`, if given, adds get_past_notes (read-only) so
+    the agent can reorient using SkyTrap's own past work-log notes for this
+    workspace."""
     on_write_logged = None
     if on_write is not None:
 
@@ -262,21 +264,22 @@ def _build_full_toolset(
         ReadFileTool(),
         ListDirectoryTool(),
         SearchCodeTool(),
+        StructuralSearchTool(),
         GitStatusTool(),
         GitDiffTool(),
         InspectProjectTool(),
         SecurityAuditTool(),
-        WriteFileTool(confirm=confirm_write, on_write=on_write_logged),
-        DeleteFileTool(confirm=confirm_delete, on_delete=on_delete_logged),
-        ShellTool(confirm=shell_confirm, confirm_destructive=confirm_shell),
+        WriteFileTool(confirm=_always_approve, on_write=on_write_logged),
+        DeleteFileTool(confirm=_always_approve, on_delete=on_delete_logged),
+        ShellTool(confirm=_always_approve, confirm_destructive=_always_approve),
         RunTestsTool(),
         LighthouseAuditTool(),
         AccessibilityCheckTool(),
         HtmlLintTool(),
         CssLintTool(),
-        StartBackgroundProcessTool(confirm=start_process_confirm),
+        StartBackgroundProcessTool(confirm=_always_approve),
         ListBackgroundProcessesTool(),
-        StopBackgroundProcessTool(confirm=stop_process_confirm),
+        StopBackgroundProcessTool(confirm=_always_approve),
     ]
     if memory is not None:
         tools.append(GetPastNotesTool(memory=memory))
@@ -284,9 +287,33 @@ def _build_full_toolset(
         # toolset here. Nothing above this line changes — existing tools are still a
         # plain hard-coded list, this just appends whatever skills exist on top.
         tools.extend(
-            build_registered_tools(RegistryContext(memory=memory, confirm_write=confirm_write))
+            build_registered_tools(RegistryContext(memory=memory, confirm_write=_always_approve))
         )
     return tools
+
+
+def _build_full_executor(
+    workspace: WorkspaceContext,
+    *,
+    memory: SqliteMemory | None = None,
+    on_write=None,
+    on_delete=None,
+    approval_callback=None,
+) -> ToolExecutor:
+    """Item 1 — the one `ToolExecutor` interactive chat (`skytrap`) routes every
+    write_file/patch_file/delete_file/shell call through — identically to
+    `skytrap agent run` (see `AutonomousTaskService._loop`). Same RiskEngine, same
+    ApprovalEngine, same inspect-before-write guard, same incremental symbol_index
+    updates. `approval_callback` is what a HIGH/CRITICAL-risk action's approval
+    routes through; `None` means such actions are left PENDING rather than
+    silently approved."""
+    tools = _build_full_toolset(workspace, on_write=on_write, on_delete=on_delete, memory=memory)
+    return ToolExecutor(
+        tools,
+        RiskEngine(),
+        ApprovalEngine(callback=approval_callback, auto_approve_through=RiskLevel.MEDIUM),
+        capabilities=FULL_INTERACTIVE_CAPABILITIES,
+    )
 
 
 @app.callback(invoke_without_command=True)
@@ -299,8 +326,37 @@ def main(ctx: typer.Context) -> None:
     state = ChatState()
     memory = SqliteMemory()
     touched_files: list[str] = []
-    tools = _build_full_toolset(
-        workspace, state=state, memory=memory, on_write=touched_files.append, on_delete=touched_files.append
+    renderer = AgentRenderer()
+
+    def mode_aware_approval(request: ApprovalRequest) -> bool:
+        # Item 1 — the single RiskEngine/ApprovalEngine decides *whether* an
+        # action is HIGH/CRITICAL risk identically in every mode; "auto" mode
+        # only changes whether a human is actually asked once it gets here —
+        # and CRITICAL (secrets/credentials) is never auto-approved, matching
+        # the historical "destructive tier always asks" guarantee.
+        if state.mode == "auto" and request.assessment.level < RiskLevel.CRITICAL:
+            renderer.render_risk_prompt(
+                request.assessment.level.name,
+                _approval_action_label(request),
+                request.assessment.capability.value,
+            )
+            console.print('[dim](auto-approved — mode is "auto")[/dim]')
+            return True
+        return _approve_autonomous_action(request, renderer)
+
+    # Item 1 — UNIFY EXECUTION: the interactive session's one ToolExecutor, the
+    # same RiskEngine/ApprovalEngine/inspect-before-write guard `skytrap agent
+    # run` uses. `agent_task`/`agent_memory` persist across the whole session (not
+    # rebuilt per message) so the write guard remembers a file read three turns
+    # ago, and `executor.symbol_index` gets updated incrementally after each write.
+    agent_task = TaskState(workspace_path=workspace.path, goal="interactive session")
+    agent_memory = WorkingMemory(objective="interactive session")
+    executor = _build_full_executor(
+        workspace,
+        memory=memory,
+        on_write=touched_files.append,
+        on_delete=touched_files.append,
+        approval_callback=mode_aware_approval,
     )
     history: list[dict] = []
     session_id = memory.start_session(str(workspace.path))
@@ -309,7 +365,6 @@ def main(ctx: typer.Context) -> None:
     # turns carry no memory at all (they're excluded from `history`), so "Go." would
     # go right back to the read-only Architect with no idea what plan it just gave.
     last_plan: list[str] = []
-    renderer = AgentRenderer()
 
     def on_step(step: dict) -> None:
         renderer.finish_activity()
@@ -338,7 +393,9 @@ def main(ctx: typer.Context) -> None:
             try:
                 reply = run_agent_turn(
                     model,
-                    tools,
+                    executor,
+                    agent_task,
+                    agent_memory,
                     workspace,
                     history,
                     augmented_input,
@@ -370,7 +427,9 @@ def main(ctx: typer.Context) -> None:
         try:
             reply = run_agent_turn(
                 model,
-                tools,
+                executor,
+                agent_task,
+                agent_memory,
                 workspace,
                 history,
                 user_input,
@@ -422,6 +481,134 @@ def commands() -> None:
     print_command_map(generate_command_map(click_command))
 
 
+_DOCTOR_SYMBOL = {HEALTHY: ("✓", "green"), DEGRADED: ("⚠", "yellow")}
+
+
+@app.command()
+def doctor(fix_plan: bool = typer.Option(False, "--fix-plan", help="Print OS-specific remediation commands without executing them.")) -> None:
+    """Health check every part the autonomous runtime depends on: Ollama, git,
+    ripgrep, Tree-sitter, ast-grep, LSP servers, task-state storage, workspace
+    permissions, the tool registry, decision parsing, the patch engine, and
+    verification-command discovery. Every line reflects a real probe, not an
+    assumption."""
+    workspace = detect_workspace()
+    report = run_doctor(workspace)
+    for check in report.checks:
+        symbol, style = _DOCTOR_SYMBOL.get(check.status, ("✗", "red"))
+        console.print(f"[{style}]{symbol}[/{style}] [bold]{check.name}[/bold] — {check.detail}")
+        if check.recommendation:
+            console.print(f"    [dim]{check.recommendation}[/dim]")
+    overall_symbol, overall_style = _DOCTOR_SYMBOL.get(report.overall, ("✗", "red"))
+    console.print(
+        f"\n[{overall_style}]{overall_symbol} Overall: {report.overall}[/{overall_style}]"
+    )
+    if report.ollama is not None:
+        console.print("\n[bold]Ollama layers[/bold]")
+        for label, value in (
+            ("binary", report.ollama.binary_present), ("daemon", report.ollama.daemon_accessible),
+            ("API", report.ollama.api_accessible), ("configured model", report.ollama.model_present),
+            ("model load", report.ollama.model_loadable), ("minimal generation", report.ollama.generation_working),
+        ):
+            console.print(f"  {'✓' if value else '✗'} {label}")
+    if report.lsp_servers:
+        console.print("\n[bold]LSP matrix[/bold]")
+        for server in report.lsp_servers:
+            tested = ", ".join(server.capabilities_tested) or "none"
+            console.print(f"  {server.language:<22} {server.server:<28} {server.status:<11} reachable={server.reachable} tested={tested}")
+    console.print(f"[bold]Software Readiness: {report.software_readiness}/10[/bold]")
+    console.print(f"[bold]Environment Readiness: {report.environment_readiness}/10[/bold]")
+    console.print("\n[bold cyan]SkyTrap Intelligence Health Report[/bold cyan]")
+    for dimension in intelligence_health_report(report):
+        console.print(f"  {dimension.name:<28} {dimension.score}/10  [dim]{dimension.evidence}[/dim]")
+    if fix_plan:
+        console.print("\n[bold yellow]Fix plan (commands are suggestions only; none were executed)[/bold yellow]")
+        items = build_fix_plan(report)
+        if not items:
+            console.print("  No remediation required.")
+        for item in items:
+            console.print(f"  [bold]{item.capability}[/bold] — {item.reason}\n    [cyan]{item.command}[/cyan]")
+    if report.overall != HEALTHY:
+        raise typer.Exit(1)
+
+
+@app.command()
+def bench(
+    target: str | None = typer.Argument(None, help="Optional benchmark target (`models`)."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Run the local SkyTrap engineering-agent benchmark fixtures."""
+    from skytrap.bench import SkyTrapBench
+
+    if target is not None:
+        if target != "models":
+            console.print(f"[red]Unknown benchmark target: {target}[/red]")
+            raise typer.Exit(2)
+        from skytrap.models.ollama import OllamaHealthStatus, probe_ollama
+        from skytrap.models.qualification import ModelQualificationSuite
+
+        health = probe_ollama()
+        if health.status != OllamaHealthStatus.HEALTHY:
+            console.print(f"[red]{health.status.value}: {health.detail}[/red]")
+            raise typer.Exit(1)
+        result = ModelQualificationSuite().run(OllamaProvider())
+        if json_output:
+            typer.echo(result.model_dump_json(indent=2))
+        else:
+            console.print("[bold cyan]🐇 SKYTRAP MODEL QUALIFICATION[/bold cyan]")
+            console.print(result.model_dump_json(indent=2))
+        if not result.qualified:
+            raise typer.Exit(1)
+        return
+
+    report = SkyTrapBench().run()
+    if json_output:
+        typer.echo(report.model_dump_json(indent=2))
+        return
+    console.print("[bold cyan]🐇 SKYTRAP BENCH[/bold cyan]")
+    for scenario in report.scenarios:
+        mark = "✓" if scenario.passed else "✗"
+        style = "green" if scenario.passed else "red"
+        console.print(f"[{style}]{mark}[/{style}] {scenario.name} · {scenario.duration_ms} ms")
+    console.print(f"\nSuccess rate: [bold]{report.success_rate:.0%}[/bold] · {report.duration_ms} ms")
+    if report.success_rate < 1:
+        raise typer.Exit(1)
+
+
+@update_app.command("check")
+def update_check(json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON.")) -> None:
+    """Check official registries for relevant updates; never installs anything."""
+    from skytrap.technology.watch import TechnologyWatch
+
+    report = TechnologyWatch().check()
+    if json_output:
+        typer.echo(report.model_dump_json(indent=2))
+        return
+    console.print("[bold cyan]╭─ 🐇 RABBIT SCOUT ─ Technology intelligence[/bold cyan]")
+    current_category = None
+    for finding in report.findings:
+        if finding.category != current_category:
+            current_category = finding.category
+            console.print(f"\n[bold]{current_category.value.upper()}[/bold]")
+        up_to_date = finding.recommendation.startswith("keep")
+        symbol, style = ("✓", "green") if up_to_date else ("⚠", "yellow")
+        versions = f"{finding.current_version or 'not installed'}"
+        if finding.available_version:
+            versions += f" → {finding.available_version}"
+        console.print(f"[{style}]{symbol}[/{style}] {finding.technology}  {versions}  [bold]{finding.status.value}[/bold]")
+        console.print(f"  [dim]{finding.recommendation} · source: {finding.source}[/dim]")
+        if finding.category.value == "models":
+            console.print(
+                f"  [dim]hardware fit: {finding.hardware_fit or 'unknown'} · "
+                f"expected benefit: {finding.expected_benefit or 'none established'} · "
+                f"benchmark required: {'yes' if finding.benchmark_required else 'no'}[/dim]"
+            )
+    kept = sum(item.recommendation.startswith("keep") for item in report.findings)
+    console.print(
+        f"\nRecommendation: benchmark {report.benchmark_candidates} model candidate(s); "
+        f"upgrade {report.upgrade_candidates} development tool(s); keep {kept} unchanged."
+    )
+
+
 @app.command()
 def plan(task: str) -> None:
     """Analyze TASK against this workspace and print an implementation plan.
@@ -459,11 +646,17 @@ def build(task: str) -> None:
         tools = _build_full_toolset(
             workspace, on_write=touched_files.append, on_delete=touched_files.append, memory=memory
         )
+        renderer = AgentRenderer()
+
+        def approval_callback(request: ApprovalRequest) -> bool:
+            return _approve_autonomous_action(request, renderer)
 
         current_task = task
         for attempt in range(1, MAX_AUTOFIX_ATTEMPTS + 1):
             log_step(f"Developer is implementing the plan... ({attempt}/{MAX_AUTOFIX_ATTEMPTS})")
-            summary = run_developer(model, tools, workspace, current_task, plan_text)
+            summary = run_developer(
+                model, tools, workspace, current_task, plan_text, approval_callback=approval_callback
+            )
 
             log_step("Running the test suite...")
             test_result = RunTestsTool().execute(workspace, {})

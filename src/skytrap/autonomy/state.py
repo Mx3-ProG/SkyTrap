@@ -20,6 +20,7 @@ class TaskStatus(StrEnum):
     PLANNING = "planning"
     RUNNING = "running"
     VERIFYING = "verifying"
+    REVIEWING = "reviewing"
     NEEDS_APPROVAL = "needs_approval"
     COMPLETED = "completed"
     BLOCKED = "blocked"
@@ -58,6 +59,8 @@ class TaskState(BaseModel):
     base_commit: str | None = None
     checkpoint_commit: str | None = None
     final_diff: str | None = None
+    execution_evidence: dict[str, Any] | None = None
+    review_result: dict[str, Any] | None = None
     rolled_back: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

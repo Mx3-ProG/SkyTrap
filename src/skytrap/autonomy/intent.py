@@ -228,8 +228,13 @@ class HumanIntentEngine:
     @staticmethod
     def _constraints(text: str) -> list[str]:
         constraints: list[str] = []
-        for clause in re.split(r"[,;]", text):
+        for clause in re.split(
+            r"[,;]|\b(?:et|and)\b(?=\s+(?:change|modifie|ajoute|supprime|remove|keep|garde))",
+            text,
+            flags=re.I,
+        ):
             clause = clause.strip(" .")
+            clause = re.sub(r"^(?:finalement|actually|plutôt|plutot)\s+", "", clause, flags=re.I)
             if re.search(r"\b(ne|sans|sauf|garde|don't|do not|keep|except)\b", clause, re.I):
                 constraints.append(clause)
         if re.search(r"\b(garde le reste|keep the rest|sans redesign|without redesign)\b", text, re.I):

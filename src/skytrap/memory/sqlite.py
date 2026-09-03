@@ -100,5 +100,12 @@ class SqliteMemory:
         ).fetchall()
         return [Note(*row) for row in rows]
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Exposes the underlying connection so co-located stores (e.g.
+        `skytrap.intelligence.repository_memory.RepositoryMemoryStore`) can
+        share the same sqlite database/file instead of opening a second one."""
+        return self._conn
+
     def close(self) -> None:
         self._conn.close()

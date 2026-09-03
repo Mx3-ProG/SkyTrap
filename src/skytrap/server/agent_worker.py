@@ -29,18 +29,20 @@ def build_server_toolset(
     memory: SqliteMemory | None = None,
     on_write: Callable[[str], None] | None = None,
 ) -> list[Tool]:
-    """Same toolset as cli.py::_build_full_toolset, but every confirm callback
-    calls bridge.request(preview, kind) instead of Rich's Confirm.ask() — routes
-    the confirmation over the WebSocket instead of the terminal. Deliberately
-    duplicated here (~15 lines) rather than shared with cli.py: two callers
-    (Rich-terminal confirm vs. WebSocket-bridge confirm) don't justify a common
-    abstraction yet, matching this project's stance against premature abstraction.
+    """Same toolset as cli.py::_build_full_toolset. Item 1 — UNIFY EXECUTION: every
+    tool here is built with an always-approve `confirm` (matching
+    `skytrap.autonomy.tools.build_autonomous_tools`'s and cli.py's convention) —
+    the single approval boundary is the `ToolExecutor` `run_server_task` wraps
+    this list in, whose `approval_callback` routes to `bridge.request(...)` over
+    the WebSocket instead of a terminal prompt. A tool-level confirm here would
+    be a second, parallel policy; that's exactly what this unification removes.
     `on_write`, if given, is forwarded to WriteFileTool to track touched paths —
     used to scope the Reviewer's diff to only what the Developer actually wrote.
     Skills (registry-based tools) are intentionally excluded for this milestone —
     `normal` mode scope is the base toolset proven against a real confirmation
     round-trip first; skills are a mechanical addition once that's solid.
     """
+    always_approve = lambda _preview: True  # noqa: E731 - see docstring: policy lives in ToolExecutor now
     tools: list[Tool] = [
         ReadFileTool(),
         ListDirectoryTool(),
@@ -49,17 +51,46 @@ def build_server_toolset(
         GitDiffTool(),
         InspectProjectTool(),
         SecurityAuditTool(),
-        WriteFileTool(confirm=lambda preview: bridge.request(preview, "write"), on_write=on_write),
-        DeleteFileTool(confirm=lambda preview: bridge.request(preview, "delete")),
-        ShellTool(confirm=lambda preview: bridge.request(preview, "shell")),
+        WriteFileTool(confirm=always_approve, on_write=on_write),
+        DeleteFileTool(confirm=always_approve),
+        ShellTool(confirm=always_approve),
         RunTestsTool(),
-        StartBackgroundProcessTool(confirm=lambda preview: bridge.request(preview, "start_process")),
+        StartBackgroundProcessTool(confirm=always_approve),
         ListBackgroundProcessesTool(),
-        StopBackgroundProcessTool(confirm=lambda preview: bridge.request(preview, "stop_process")),
+        StopBackgroundProcessTool(confirm=always_approve),
     ]
     if memory is not None:
         tools.append(GetPastNotesTool(memory=memory))
     return tools
+
+
+def _bridge_approval_callback(bridge: ConfirmationBridge):
+    """Adapts the WebSocket confirmation bridge into the `ApprovalRequest -> bool`
+    shape `ToolExecutor`'s `ApprovalEngine` expects — the server-side counterpart
+    of cli.py's `_approve_autonomous_action`."""
+
+    _KIND_BY_TOOL = {
+        "write_file": "write",
+        "patch_file": "write",
+        "delete_file": "delete",
+        "shell": "shell",
+        "start_process": "start_process",
+        "stop_process": "stop_process",
+    }
+
+    def approve(request) -> bool:
+        safe_arguments = {
+            key: value for key, value in request.arguments.items() if key not in {"content", "replacement", "expected"}
+        }
+        preview = str(
+            safe_arguments.get("command")
+            or safe_arguments.get("path")
+            or f"{request.tool_name} {safe_arguments}"
+        )
+        kind = _KIND_BY_TOOL.get(request.tool_name, request.tool_name)
+        return bool(bridge.request(preview, kind))
+
+    return approve
 
 
 def run_server_task(
@@ -99,7 +130,15 @@ def run_server_task(
     try:
         touched_files: list[str] = []
         tools = build_server_toolset(bridge, memory=memory, on_write=touched_files.append)
-        summary = run_developer(model, tools, workspace, task, plan_text, on_step=on_progress)
+        summary = run_developer(
+            model,
+            tools,
+            workspace,
+            task,
+            plan_text,
+            on_step=on_progress,
+            approval_callback=_bridge_approval_callback(bridge),
+        )
 
         test_result = RunTestsTool().execute(workspace, {})
         on_progress({"tool": "run_tests", "arguments": {}, "observation": test_result.output})

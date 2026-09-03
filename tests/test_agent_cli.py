@@ -117,6 +117,8 @@ def test_agent_run_retries_checkpoints_reports_status_and_rolls_back(
     assert task.checkpoint_commit and task.checkpoint_commit != task.base_commit
     assert task.final_diff and "+answer = 'fixed'" in task.final_diff
     assert task.plan["revision"] == 2
+    assert task.execution_evidence
+    assert task.review_result and task.review_result["passed"] is True
     assert (repo / "app.py").read_text() == "answer = 'fixed'\n"
     branch = subprocess.run(
         ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True, check=True

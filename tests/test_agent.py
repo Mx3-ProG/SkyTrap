@@ -1,5 +1,10 @@
 import json
 
+from skytrap.autonomy.approval import ApprovalEngine
+from skytrap.autonomy.executor import ToolExecutor
+from skytrap.autonomy.memory import WorkingMemory
+from skytrap.autonomy.risk import Capability, RiskEngine
+from skytrap.autonomy.state import TaskState
 from skytrap.core.agent import _build_system_prompt, _load_project_instructions, _parse_decision, run_agent_turn
 from skytrap.core.context import WorkspaceContext
 from skytrap.core.project_notes import append_journal_entry
@@ -9,6 +14,22 @@ from skytrap.tools.base import Tool, ToolResult
 
 def _workspace(tmp_path):
     return WorkspaceContext(path=tmp_path, name=tmp_path.name, is_git=False)
+
+
+def _turn(tmp_path, tools=()):
+    """Item 1 — run_agent_turn now always routes through a real ToolExecutor
+    (RiskEngine + ApprovalEngine), the same one skytrap agent run uses. This
+    builds a fresh executor/task/memory triple for a single test call."""
+    workspace = _workspace(tmp_path)
+    executor = ToolExecutor(
+        list(tools),
+        RiskEngine(),
+        ApprovalEngine(),
+        capabilities={Capability.FILESYSTEM_READ, Capability.FILESYSTEM_WRITE, Capability.SHELL_EXECUTE},
+    )
+    task = TaskState(workspace_path=workspace.path, goal="test")
+    memory = WorkingMemory(objective="test")
+    return executor, task, memory, workspace
 
 
 class _CountingModel(ModelProvider):
@@ -92,13 +113,15 @@ def test_parse_decision_falls_back_to_raw_text_on_garbage():
 
 def test_run_agent_turn_respects_custom_max_steps(tmp_path):
     model = _CountingModel()
-    run_agent_turn(model, [], _workspace(tmp_path), [], "do something", max_steps=3)
+    executor, task, memory, workspace = _turn(tmp_path)
+    run_agent_turn(model, executor, task, memory, workspace, [], "do something", max_steps=3)
     assert model.calls == 3
 
 
 def test_run_agent_turn_defaults_to_five_steps(tmp_path):
     model = _CountingModel()
-    run_agent_turn(model, [], _workspace(tmp_path), [], "do something")
+    executor, task, memory, workspace = _turn(tmp_path)
+    run_agent_turn(model, executor, task, memory, workspace, [], "do something")
     assert model.calls == 5
 
 
@@ -138,10 +161,13 @@ def test_execution_guard_rejects_hedge_and_accepts_after_real_write(tmp_path):
             _final("Created a.py."),
         ]
     )
+    executor, task, memory, workspace = _turn(tmp_path, tools=[_FakeWriteFileTool()])
     result = run_agent_turn(
         model,
-        [_FakeWriteFileTool()],
-        _workspace(tmp_path),
+        executor,
+        task,
+        memory,
+        workspace,
         [],
         "Programme ce projet.",
         max_steps=10,
@@ -159,10 +185,13 @@ def test_execution_guard_gives_up_after_max_rejections(tmp_path):
             _final("I can show you how, but I cannot build it myself."),
         ]
     )
+    executor, task, memory, workspace = _turn(tmp_path)
     result = run_agent_turn(
         model,
-        [],
-        _workspace(tmp_path),
+        executor,
+        task,
+        memory,
+        workspace,
         [],
         "Programme ce projet.",
         max_steps=10,
@@ -178,10 +207,13 @@ def test_execution_guard_accepts_legitimate_zero_tool_answer(tmp_path):
     # accepted immediately — the guard targets hedging, not the absence of a tool
     # call by itself.
     model = _ScriptedModel([_final("No changes needed — this can be answered directly.")])
+    executor, task, memory, workspace = _turn(tmp_path)
     result = run_agent_turn(
         model,
-        [],
-        _workspace(tmp_path),
+        executor,
+        task,
+        memory,
+        workspace,
         [],
         "Programme ce projet.",
         max_steps=10,
@@ -193,8 +225,9 @@ def test_execution_guard_accepts_legitimate_zero_tool_answer(tmp_path):
 
 def test_execution_guard_inactive_when_not_required(tmp_path):
     model = _ScriptedModel([_final("I cannot create an entire project, but I can show you how.")])
+    executor, task, memory, workspace = _turn(tmp_path)
     result = run_agent_turn(
-        model, [], _workspace(tmp_path), [], "Explique-moi ce fichier.", max_steps=10
+        model, executor, task, memory, workspace, [], "Explique-moi ce fichier.", max_steps=10
     )
     assert result == "I cannot create an entire project, but I can show you how."
     assert model.calls == 1

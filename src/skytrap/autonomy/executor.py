@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
@@ -9,7 +10,21 @@ from skytrap.autonomy.memory import WorkingMemory
 from skytrap.autonomy.risk import Capability, RiskEngine
 from skytrap.autonomy.state import TaskState
 from skytrap.core.context import WorkspaceContext
+from skytrap.intelligence.symbols import SymbolIndex
 from skytrap.tools.base import Tool, ToolResult
+from skytrap.tools.filesystem import resolve_in_workspace
+
+# Item 10 — INSPECT BEFORE WRITE. A full-content write to a path that already
+# exists on disk is refused unless the model has read (or itself already
+# written/deleted) that exact path earlier in this task — i.e. it is not
+# blindly overwriting content it never actually looked at. This is the
+# concrete, enforced fix for the "announced creating index.html" bug.
+# patch_file is deliberately NOT guarded the same way: PatchEngine already
+# requires the exact current snippet ("expected") to match before applying,
+# so a stale/assumed view of the file fails the replacement itself rather
+# than silently clobbering unseen content — the same invariant, enforced by
+# a different, already-existing mechanism.
+GUARDED_WRITE_TOOLS = {"write_file"}
 
 
 class ToolExecutor:
@@ -21,6 +36,7 @@ class ToolExecutor:
         risk_engine: RiskEngine,
         approval_engine: ApprovalEngine,
         capabilities: set[Capability] | None = None,
+        symbol_index: SymbolIndex | None = None,
     ):
         self.tools = {tool.name: tool for tool in tools}
         self.risk_engine = risk_engine
@@ -30,6 +46,11 @@ class ToolExecutor:
             Capability.FILESYSTEM_WRITE,
             Capability.SHELL_EXECUTE,
         }
+        # Item 4 — kept incrementally up to date as writes/deletes happen, rather
+        # than rebuilt from scratch; settable after construction because the
+        # AgentLoop builds the initial index (repository discovery) before the
+        # executor's first call.
+        self.symbol_index = symbol_index
 
     def execute(
         self,
@@ -75,11 +96,18 @@ class ToolExecutor:
             self._record(memory, tool_name, arguments, result, call_id)
             return result
 
+        if tool_name in GUARDED_WRITE_TOOLS:
+            guard = self._inspect_before_write_denial(memory, workspace, arguments, metadata)
+            if guard is not None:
+                self._record(memory, tool_name, arguments, guard, call_id)
+                return guard
+
         request = ApprovalRequest(
             task_id=task.task_id,
             tool_name=tool_name,
             arguments=arguments,
             assessment=assessment,
+            normalized_intent=intent,
         )
         decision = self.approval_engine.decide(request)
         if decision == ApprovalDecision.PENDING:
@@ -113,7 +141,38 @@ class ToolExecutor:
         if not result.stderr and not result.success:
             result.stderr = result.output
         self._record(memory, tool_name, arguments, result, call_id)
+        if result.success and self.symbol_index is not None and tool_name in {"write_file", "patch_file", "delete_file"}:
+            path = arguments.get("path")
+            if path:
+                if tool_name == "delete_file":
+                    self.symbol_index.remove_file(path)
+                else:
+                    self.symbol_index.update_file(workspace, path)
         return result
+
+    @staticmethod
+    def _inspect_before_write_denial(
+        memory: WorkingMemory, workspace: WorkspaceContext, arguments: dict, metadata: dict
+    ) -> ToolResult | None:
+        path_arg = arguments.get("path")
+        if not path_arg:
+            return None
+        ok, resolved = resolve_in_workspace(workspace, path_arg)
+        if not ok or not Path(resolved).exists():
+            return None
+        inspected = path_arg in memory.files_consulted or path_arg in memory.files_modified
+        if inspected:
+            return None
+        return ToolResult(
+            success=False,
+            status="denied",
+            output=(
+                f"Refused: '{path_arg}' already exists on disk and has not been read or modified "
+                "in this task yet — writing to it now would be based on stale/assumed content, "
+                "not what's actually there. Call read_file on it first, then retry the write."
+            ),
+            metadata=metadata,
+        )
 
     @staticmethod
     def _record(
@@ -132,4 +191,6 @@ class ToolExecutor:
             status=result.status,
             error=result.stderr if not result.success else None,
             tool_call_id=call_id,
+            is_new_file=result.metadata.get("is_new_file"),
+            is_delete=result.metadata.get("is_delete"),
         )

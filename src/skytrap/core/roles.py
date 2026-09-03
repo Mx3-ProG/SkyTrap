@@ -1,5 +1,10 @@
 from typing import Callable
 
+from skytrap.autonomy.approval import ApprovalEngine
+from skytrap.autonomy.executor import ToolExecutor
+from skytrap.autonomy.memory import WorkingMemory
+from skytrap.autonomy.risk import Capability, FULL_INTERACTIVE_CAPABILITIES, RiskEngine, RiskLevel
+from skytrap.autonomy.state import TaskState
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext
 from skytrap.memory.sqlite import SqliteMemory
@@ -73,6 +78,22 @@ def _looks_like_refusal(text: str) -> bool:
     return any(pattern in lowered for pattern in _REFUSAL_PATTERNS)
 
 
+def _read_only_executor(tools: list[Tool]) -> ToolExecutor:
+    """Item 1 — UNIFY EXECUTION: every role (Architect/Developer/Reviewer), same as
+    interactive chat and `skytrap agent run`, routes its tool calls through the one
+    ToolExecutor (RiskEngine + ApprovalEngine + inspect-before-write guard), never
+    a bespoke per-tool confirm() path. Read-only roles get no approval callback —
+    every tool they're given only ever needs FILESYSTEM_READ/SHELL_EXECUTE
+    capability, which auto-approves at MEDIUM risk; there is nothing here that can
+    mutate the workspace regardless."""
+    return ToolExecutor(
+        tools,
+        RiskEngine(),
+        ApprovalEngine(),
+        capabilities={Capability.FILESYSTEM_READ, Capability.SHELL_EXECUTE},
+    )
+
+
 def run_architect(
     model: ModelProvider,
     workspace: WorkspaceContext,
@@ -89,7 +110,7 @@ def run_architect(
     hypothetical. One retry catches most of these without masking a genuinely broken
     task (if it refuses twice, that's returned as-is rather than looping forever).
     """
-    read_only_tools = [
+    read_only_tools: list[Tool] = [
         ReadFileTool(),
         ListDirectoryTool(),
         SearchCodeTool(),
@@ -98,12 +119,17 @@ def run_architect(
     ]
     if memory is not None:
         read_only_tools.append(GetPastNotesTool(memory=memory))
+    executor = _read_only_executor(read_only_tools)
 
     for _ in range(2):
         history: list[dict] = []
+        agent_task = TaskState(workspace_path=workspace.path, goal=task)
+        agent_memory = WorkingMemory(objective=task)
         result = run_agent_turn(
             model,
-            read_only_tools,
+            executor,
+            agent_task,
+            agent_memory,
             workspace,
             history,
             task,
@@ -132,7 +158,9 @@ Implement the change using the available tools: write_file to create or edit fil
 shell for anything else needed, run_tests to check your work once you're done. Every \
 write_file and shell call already shows the user a preview and asks for their approval \
 before anything happens — that confirmation is handled automatically outside of you, so \
-just call the tool directly, one call per response as usual.
+just call the tool directly, one call per response as usual. If a file you want to write \
+to already exists, read_file it first — writing to an existing file you haven't read in \
+this task will be refused.
 
 When you have implemented the plan, respond with type "final" and briefly summarize \
 what you changed (which files, what for) — not a restatement of the plan."""
@@ -149,19 +177,39 @@ def run_developer(
     plan: str,
     max_steps: int = DEVELOPER_MAX_STEPS,
     on_step: Callable[[dict], None] | None = None,
+    approval_callback: Callable | None = None,
 ) -> str:
     """Implements a plan produced by run_architect, using the full (mutating) toolset
-    the caller passes in. Each write_file/shell call still goes through its own
-    confirmation gate — this role doesn't bypass that, it just decides what to call.
-    Defaults to a higher step budget than the other roles (DEVELOPER_MAX_STEPS=12,
-    vs. run_agent_turn's own default of 5) since a real task routinely needs several
-    reads plus one or more writes/deletes plus a test run.
+    the caller passes in. Each write_file/patch_file/delete_file/shell call goes
+    through the same ToolExecutor (RiskEngine + ApprovalEngine + inspect-before-write
+    guard) as `skytrap agent run` — this role doesn't bypass that policy, it just
+    decides what to call. `tools` must be built with an always-approve `confirm`
+    (e.g. `WriteFileTool(confirm=lambda _: True)`, matching
+    `skytrap.autonomy.tools.build_autonomous_tools`'s convention) — ToolExecutor's
+    RiskEngine/ApprovalEngine is the single policy/approval boundary; a tool's own
+    `confirm` is no longer a second one, so it must not prompt on its own.
+    `approval_callback`, if given, is what real human approval routes through (a
+    Rich prompt in the CLI, a WebSocket bridge on the server) — `None` means every
+    approval-requiring action is left PENDING (safe default, never silently
+    approved). Defaults to a higher step budget than the other roles
+    (DEVELOPER_MAX_STEPS=12, vs. run_agent_turn's own default of 5) since a real task
+    routinely needs several reads plus one or more writes/deletes plus a test run.
     """
+    executor = ToolExecutor(
+        tools,
+        RiskEngine(),
+        ApprovalEngine(callback=approval_callback, auto_approve_through=RiskLevel.MEDIUM),
+        capabilities=FULL_INTERACTIVE_CAPABILITIES,
+    )
     history: list[dict] = []
     augmented_task = f"{task}\n\nImplementation plan to follow:\n{plan}"
+    agent_task = TaskState(workspace_path=workspace.path, goal=task)
+    agent_memory = WorkingMemory(objective=task)
     return run_agent_turn(
         model,
-        tools,
+        executor,
+        agent_task,
+        agent_memory,
         workspace,
         history,
         augmented_task,
@@ -217,7 +265,7 @@ def run_reviewer(
     are included too: a diff that made the test suite fail is the single most important
     thing to flag, and the Reviewer can't know that from the diff text alone.
     """
-    read_only_tools = [
+    read_only_tools: list[Tool] = [
         ReadFileTool(),
         ListDirectoryTool(),
         SearchCodeTool(),
@@ -231,6 +279,7 @@ def run_reviewer(
     ]
     if memory is not None:
         read_only_tools.append(GetPastNotesTool(memory=memory))
+    executor = _read_only_executor(read_only_tools)
     history: list[dict] = []
     test_status = "PASSED" if tests_passed else "FAILED"
     prompt_input = (
@@ -238,9 +287,13 @@ def run_reviewer(
         f"Diff to review:\n{diff_text}\n\n"
         f"Test suite result ({test_status}):\n{test_output}"
     )
+    agent_task = TaskState(workspace_path=workspace.path, goal=task)
+    agent_memory = WorkingMemory(objective=task)
     return run_agent_turn(
         model,
-        read_only_tools,
+        executor,
+        agent_task,
+        agent_memory,
         workspace,
         history,
         prompt_input,

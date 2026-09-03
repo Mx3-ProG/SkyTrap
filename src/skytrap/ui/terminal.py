@@ -28,9 +28,9 @@ ChatMode = Literal["normal", "plan", "auto"]
 MODE_CYCLE: tuple[ChatMode, ...] = ("normal", "plan", "auto")
 MODE_STYLES: dict[ChatMode, str] = {"normal": "cyan", "plan": "yellow", "auto": "green"}
 MODE_DESCRIPTIONS: dict[ChatMode, str] = {
-    "normal": "safe actions run immediately; installs/scripts ask first; destructive actions (rm, git reset/push, secrets) always ask",
+    "normal": "low/medium-risk actions (writes, ordinary shell) run immediately; deletes and other high-risk actions ask; secrets always ask",
     "plan": "read-only — Architect analyzes and plans, nothing can be changed",
-    "auto": "safe + medium-risk actions run immediately; destructive actions (rm, git reset/push, secrets) still always ask",
+    "auto": "low/medium/high-risk actions run immediately (shown, not silent); secrets still always ask",
 }
 
 SUCCESS = "✓"
@@ -286,6 +286,19 @@ def print_agent_event(
         else:
             label, style = "FAIL", "red"
         target.print(Text(f"{symbol['branch']} {symbol['explore']} {stage} ........ {label}", style=_style(caps, style)))
+    elif kind == "browser_verification":
+        if event.get("skipped"):
+            label, style = "SKIP", "bright_black"
+        elif event.get("success"):
+            label, style = "PASS", "green"
+        else:
+            label, style = "FAIL", "red"
+        target.print(Text(f"{symbol['branch']} {symbol['explore']} browser ..... {label}", style=_style(caps, style)))
+    elif kind == "review_completed":
+        passed = bool(event.get("passed"))
+        mark = symbol["success"] if passed else symbol["error"]
+        findings = len(event.get("findings") or [])
+        target.print(Text(f"{symbol['branch']} {mark} independent review {'PASS' if passed else 'FAIL'} · {findings} finding(s)", style=_style(caps, "green" if passed else "red")))
     elif kind == "retry":
         target.print(Text(f"{symbol['branch']} {symbol['retry']} following another tunnel · revision {event.get('revision')}", style=_style(caps, "yellow")))
     elif kind == "checkpoint":

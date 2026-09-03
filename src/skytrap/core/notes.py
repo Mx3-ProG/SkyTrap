@@ -1,3 +1,8 @@
+from skytrap.autonomy.approval import ApprovalEngine
+from skytrap.autonomy.executor import ToolExecutor
+from skytrap.autonomy.memory import WorkingMemory
+from skytrap.autonomy.risk import RiskEngine
+from skytrap.autonomy.state import TaskState
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext
 from skytrap.models.base import ModelProvider
@@ -27,6 +32,19 @@ def run_summarizer(
     """
     history: list[dict] = []
     prompt_input = f"Task: {task}\n\nOutcome:\n{outcome_text}"
+    # Item 1 — UNIFY EXECUTION: even a tool-free role goes through the same
+    # ToolExecutor (here with an empty toolset — there's nothing to call, but the
+    # decision loop is identical) rather than a separate code path.
+    executor = ToolExecutor([], RiskEngine(), ApprovalEngine())
+    agent_task = TaskState(workspace_path=workspace.path, goal=task)
+    agent_memory = WorkingMemory(objective=task)
     return run_agent_turn(
-        model, [], workspace, history, prompt_input, role_prompt=SUMMARIZER_ROLE_PROMPT
+        model,
+        executor,
+        agent_task,
+        agent_memory,
+        workspace,
+        history,
+        prompt_input,
+        role_prompt=SUMMARIZER_ROLE_PROMPT,
     )

@@ -24,6 +24,7 @@ class WorkingMemory(BaseModel):
     conversation: list[dict[str, str]] = Field(default_factory=list)
     referenced_entities: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
+    assumption_history: list[dict[str, Any]] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     files_consulted: list[str] = Field(default_factory=list)
     files_modified: list[str] = Field(default_factory=list)
@@ -32,6 +33,7 @@ class WorkingMemory(BaseModel):
     corrections: list[str] = Field(default_factory=list)
     git_state: str | None = None
     verification_results: list[dict[str, Any]] = Field(default_factory=list)
+    review_results: list[dict[str, Any]] = Field(default_factory=list)
     events: list[MemoryEvent] = Field(default_factory=list)
 
     def record(self, kind: str, **data: Any) -> None:
@@ -49,17 +51,39 @@ class WorkingMemory(BaseModel):
         if data.get("success") is False and data.get("error"):
             self.errors.append(str(data["error"]))
 
+    def record_assumption(self, assumption: str) -> None:
+        if assumption in self.assumptions:
+            return
+        self.assumptions.append(assumption)
+        self.assumption_history.append({"assumption": assumption, "status": "active"})
+
+    def revise_assumptions(self, reason: str) -> None:
+        """Keep an audit trail while removing superseded assumptions from context."""
+        if not self.assumptions:
+            return
+        active = set(self.assumptions)
+        for item in self.assumption_history:
+            if item.get("assumption") in active and item.get("status") == "active":
+                item["status"] = "revised"
+                item["reason"] = reason
+        self.corrections.extend(
+            f"Revised assumption: {assumption} ({reason})" for assumption in self.assumptions
+        )
+        self.assumptions.clear()
+
     def compact_context(self, max_events: int = 20) -> str:
         payload = {
             "objective": self.objective,
             "conversation": self.conversation[-12:],
             "referenced_entities": self.referenced_entities[-20:],
             "assumptions": self.assumptions[-20:],
+            "assumption_history": self.assumption_history[-30:],
             "decisions": self.decisions[-20:],
             "files_consulted": self.files_consulted[-30:],
             "files_modified": self.files_modified[-30:],
             "commands_executed": self.commands_executed[-20:],
             "errors": self.errors[-10:],
+            "review_results": self.review_results[-5:],
             "events": [event.model_dump(mode="json") for event in self.events[-max_events:]],
         }
         return json.dumps(payload, ensure_ascii=False)

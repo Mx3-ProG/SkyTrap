@@ -25,6 +25,30 @@ class Capability(StrEnum):
     SECRETS_USE = "secrets:use"
 
 
+FULL_INTERACTIVE_CAPABILITIES: frozenset[Capability] = frozenset(
+    {
+        Capability.FILESYSTEM_READ,
+        Capability.FILESYSTEM_WRITE,
+        Capability.SHELL_EXECUTE,
+        Capability.SECRETS_USE,
+        Capability.GIT_COMMIT,
+        Capability.GIT_PUSH,
+    }
+)
+"""Item 1 — UNIFY EXECUTION: the one capability set every mutating execution path
+(interactive chat, `skytrap build`, the web server, and `skytrap agent run`)
+grants its ToolExecutor. A capability missing here means the *action is silently
+denied before approval is ever asked* — that's a stronger gate than
+RiskAssessment.requires_approval and must not be confused with it. Historically
+only {FILESYSTEM_READ, FILESYSTEM_WRITE, SHELL_EXECUTE} were granted, which meant
+a secrets-path write (capability=SECRETS_USE) or a `git commit`/`git push` shell
+command (capability=GIT_COMMIT/GIT_PUSH) was denied outright rather than routed
+to approval — never actually exercised because interactive mode's now-removed
+per-tool confirm() used to gate those cases entirely on its own. DEPLOY_EXECUTE
+is deliberately excluded: nothing in RiskEngine currently assigns it, and it
+would need an explicit, separate opt-in if that changes."""
+
+
 class RiskAssessment(BaseModel):
     level: RiskLevel
     capability: Capability

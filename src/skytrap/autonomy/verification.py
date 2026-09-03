@@ -47,7 +47,7 @@ class VerificationLoop:
                 discovered[stage].append(commands.check_command)
             discovered[VerificationStage.TEST].extend(commands.test_commands)
             discovered[VerificationStage.BUILD].extend(commands.build_commands)
-        return {
+        result = {
             stage: [
                 command
                 for command in dict.fromkeys(filter(None, commands))
@@ -55,6 +55,68 @@ class VerificationLoop:
             ]
             for stage, commands in discovered.items()
         }
+        if not any(result.values()):
+            # Item 6 — VERIFICATION FALLBACK ENGINE. Primary discovery is driven by
+            # manifest "scripts" (package.json) / language-profile commands, and
+            # finds nothing on e.g. a Vite/TS project with no npm scripts defined —
+            # the exact "no verification command discovered" failure mode. Only
+            # tried when discovery found literally nothing, from a small known
+            # registry, each candidate still gated by the same real-tool-presence
+            # check (_command_is_configured) as every other verification command.
+            result = self._discover_fallback(workspace)
+        return result
+
+    def _discover_fallback(self, workspace: WorkspaceContext) -> dict[VerificationStage, list[str]]:
+        root = workspace.path
+        candidates: dict[VerificationStage, list[str]] = {stage: [] for stage in VerificationStage}
+
+        if (root / "tsconfig.json").is_file():
+            candidates[VerificationStage.TYPECHECK].append("tsc --noEmit")
+        if self._vite_project(root):
+            candidates[VerificationStage.BUILD].append("vite build")
+        if self._python_tests_present(root):
+            candidates[VerificationStage.TEST].append("pytest")
+        if any(root.rglob("*.py")):
+            if (
+                (root / "ruff.toml").is_file()
+                or (root / ".ruff.toml").is_file()
+                or self._pyproject_mentions(root, "ruff")
+            ):
+                candidates[VerificationStage.LINT].append("ruff check .")
+            if (root / "mypy.ini").is_file() or self._pyproject_mentions(root, "mypy"):
+                candidates[VerificationStage.TYPECHECK].append("mypy .")
+
+        return {
+            stage: [command for command in commands if self._command_is_configured(root, command)]
+            for stage, commands in candidates.items()
+        }
+
+    @staticmethod
+    def _vite_project(root: Path) -> bool:
+        if any(root.glob("vite.config.*")):
+            return True
+        try:
+            package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        deps = {**package.get("dependencies", {}), **package.get("devDependencies", {})}
+        return "vite" in deps
+
+    @staticmethod
+    def _python_tests_present(root: Path) -> bool:
+        return (
+            any(root.rglob("test_*.py"))
+            or any(root.rglob("*_test.py"))
+            or (root / "tests").is_dir()
+        )
+
+    @staticmethod
+    def _pyproject_mentions(root: Path, tool: str) -> bool:
+        try:
+            text = (root / "pyproject.toml").read_text(encoding="utf-8").lower()
+        except OSError:
+            return False
+        return tool in text
 
     @staticmethod
     def _package_scripts(root: Path) -> tuple[dict, set[str]]:

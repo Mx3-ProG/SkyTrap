@@ -16,6 +16,7 @@ from skytrap.tools.process import (
 from skytrap.tools.project import InspectProjectTool
 from skytrap.tools.search import SearchCodeTool
 from skytrap.tools.shell import ShellTool
+from skytrap.tools.structural_search import StructuralSearchTool
 
 
 class PatchFileTool(Tool):
@@ -142,6 +143,7 @@ def build_autonomous_tools(
         ListDirectoryTool(),
         ListFilesTool(),
         SearchCodeTool(),
+        StructuralSearchTool(),
         InspectProjectTool(),
         GitStatusTool(),
         GitDiffTool(),

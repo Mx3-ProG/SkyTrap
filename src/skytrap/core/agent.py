@@ -1,14 +1,18 @@
-import json
-import re
 from typing import Callable
 
-from pydantic import ValidationError
-
+from skytrap.autonomy.executor import ToolExecutor
+from skytrap.autonomy.memory import WorkingMemory
+from skytrap.autonomy.state import TaskState
 from skytrap.core.context import WorkspaceContext
 from skytrap.core.intent import looks_like_consultant_refusal
 from skytrap.core.project_inspection import inspect_project, resolve_commands
 from skytrap.core.project_notes import load_recent_journal
-from skytrap.core.protocol import Decision
+# Re-exported for existing importers (e.g. skytrap.core.doctor) — the actual
+# implementation lives in skytrap.core.protocol so that module (not this one)
+# is the shared dependency both `run_agent_turn` here and `AgentLoop` in
+# skytrap.autonomy.loop parse decisions through, avoiding a circular import
+# now that this module also depends on skytrap.autonomy.executor.
+from skytrap.core.protocol import Decision, _parse_decision  # noqa: F401
 from skytrap.core.repo_map import build_repo_map
 from skytrap.models.base import ModelProvider
 from skytrap.tools.base import Tool
@@ -17,7 +21,7 @@ MAX_STEPS = 5
 MAX_INSTRUCTIONS_CHARS = 20_000
 INSTRUCTIONS_FILENAME = "SKYTRAP.md"
 MAX_EXECUTION_REJECTIONS = 2
-MUTATING_TOOL_NAMES = {"write_file", "delete_file", "shell"}
+MUTATING_TOOL_NAMES = {"write_file", "patch_file", "delete_file", "shell"}
 
 EXECUTION_NUDGE = (
     "You are in execution mode. The user requested implementation, not advice. You "
@@ -178,60 +182,11 @@ def _build_system_prompt(
     return prompt
 
 
-def _repair_final_message(text: str) -> str | None:
-    """Best-effort recovery for a `{"type": "final", "message": "..."}` response whose
-    message contains raw, unescaped double quotes (e.g. the model quoting a code
-    snippet like {"path": ...} inline) — this breaks JSON string boundaries in a way
-    strict/non-strict json.loads can't recover from, since the quotes are genuinely
-    ambiguous to a real parser. Only handles the "final" shape; a malformed tool_call
-    is deliberately left to fail rather than risk executing a guessed-at repair.
-    """
-    if not re.search(r'"type"\s*:\s*"final"', text):
-        return None
-
-    message_key = re.search(r'"message"\s*:\s*"', text)
-    if not message_key:
-        return None
-
-    quote_start = message_key.end()
-    quote_end = text.rfind('"')
-    if quote_end <= quote_start:
-        return None
-
-    raw_message = text[quote_start:quote_end]
-    return raw_message.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
-
-
-def _parse_decision(raw: str) -> Decision:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[len("json") :]
-        text = text.strip()
-
-    for strict in (True, False):
-        # strict=False tolerates literal control characters (raw newlines, tabs) inside
-        # JSON strings — models routinely emit multi-line "message" values that way
-        # instead of escaping them as \n, which strict JSON rejects.
-        try:
-            data = json.loads(text, strict=strict)
-            return Decision.model_validate(data)
-        except (json.JSONDecodeError, ValidationError):
-            continue
-
-    repaired = _repair_final_message(text)
-    if repaired is not None:
-        return Decision(type="final", message=repaired)
-
-    # Model didn't follow the protocol at all — treat its raw text as the final answer
-    # rather than failing the turn outright.
-    return Decision(type="final", message=raw)
-
-
 def run_agent_turn(
     model: ModelProvider,
-    tools: list[Tool],
+    executor: ToolExecutor,
+    task: TaskState,
+    memory: WorkingMemory,
     workspace: WorkspaceContext,
     history: list[dict],
     user_input: str,
@@ -244,25 +199,36 @@ def run_agent_turn(
     final answer or `max_steps` is reached. `history` is mutated in place so the
     conversation carries over between turns. `role_prompt`, if given, overrides the
     generic assistant framing (e.g. a restricted Architect role). `on_step`, if
-    given, is called after each tool result with {"tool", "arguments", "observation"}
-    — used by the web server to stream progress over a WebSocket; the CLI passes
-    None (no behavior change). `max_steps` defaults to MAX_STEPS (5), which suits
-    the short read-only/no-tools roles (Architect, Reviewer, Summarizer); the
-    Developer role — which routinely needs to read a few files, write/delete one or
-    more, and run tests — is given a higher budget by its caller.
+    given, is called after each tool result with {"tool", "arguments", "observation",
+    "metadata", "success"} — used by the web server to stream progress over a
+    WebSocket; the CLI passes None (no behavior change). `max_steps` defaults to
+    MAX_STEPS (5), which suits the short read-only/no-tools roles (Architect,
+    Reviewer, Summarizer); the Developer role — which routinely needs to read a few
+    files, write/delete one or more, and run tests — is given a higher budget by
+    its caller.
+
+    Every tool call is routed through `executor` (a `skytrap.autonomy.executor.
+    ToolExecutor`) — the exact same RiskEngine/ApprovalEngine/inspect-before-write
+    policy the autonomous `skytrap agent run` uses. There is deliberately no
+    second, parallel execution policy here: `tool.execute()` is never called
+    directly. `task`/`memory` are the caller's session-scoped `TaskState`/
+    `WorkingMemory` — carrying them across turns (not recreating them per call)
+    is what lets the inspect-before-write guard remember a file read three turns
+    ago, the same way it does within one autonomous task.
 
     `require_execution_evidence`, when True, refuses to accept a "final" answer
-    that made zero mutating tool calls (write_file/delete_file/shell) AND reads as
-    consultant-style hedging (looks_like_consultant_refusal) — the caller has
-    determined this turn is an implementation request, so a tool-free "here's how
-    you could do it" is never a valid completion. A tool-free final that is NOT a
-    hedge (e.g. "no code change is needed for this question") is still accepted —
-    the guard targets the specific reported failure mode, not every answer that
-    happens not to touch a file. Instead of returning, a nudge is appended and the
-    loop continues, up to MAX_EXECUTION_REJECTIONS times; beyond that the model's
-    own message is returned as-is (a real capability gap, not infinite retry).
+    that made zero mutating tool calls (write_file/patch_file/delete_file/shell)
+    AND reads as consultant-style hedging (looks_like_consultant_refusal) — the
+    caller has determined this turn is an implementation request, so a tool-free
+    "here's how you could do it" is never a valid completion. A tool-free final
+    that is NOT a hedge (e.g. "no code change is needed for this question") is
+    still accepted — the guard targets the specific reported failure mode, not
+    every answer that happens not to touch a file. Instead of returning, a nudge
+    is appended and the loop continues, up to MAX_EXECUTION_REJECTIONS times;
+    beyond that the model's own message is returned as-is (a real capability gap,
+    not infinite retry).
     """
-    tools_by_name = {tool.name: tool for tool in tools}
+    tools = list(executor.tools.values())
     messages = [{"role": "system", "content": _build_system_prompt(workspace, tools, role_prompt)}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_input})
@@ -291,18 +257,10 @@ def run_agent_turn(
             history.append({"role": "assistant", "content": final_message})
             return final_message
 
-        tool = tools_by_name.get(decision.tool or "")
-        metadata: dict = {}
-        success = False
-        if tool is None:
-            observation = f"ERROR: unknown tool '{decision.tool}'"
-        else:
-            result = tool.execute(workspace, decision.arguments)
-            observation = result.output if result.success else f"ERROR: {result.output}"
-            metadata = result.metadata
-            success = result.success
-            if result.success and decision.tool in MUTATING_TOOL_NAMES:
-                mutating_calls_made += 1
+        result = executor.execute(task, memory, workspace, decision.tool or "", decision.arguments)
+        observation = result.output if result.success else f"ERROR: {result.output}"
+        if result.success and decision.tool in MUTATING_TOOL_NAMES:
+            mutating_calls_made += 1
 
         if on_step is not None:
             on_step(
@@ -310,8 +268,8 @@ def run_agent_turn(
                     "tool": decision.tool,
                     "arguments": decision.arguments,
                     "observation": observation,
-                    "metadata": metadata,
-                    "success": success,
+                    "metadata": result.metadata,
+                    "success": result.success,
                 }
             )
 

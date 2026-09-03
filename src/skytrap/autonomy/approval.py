@@ -5,6 +5,7 @@ from typing import Callable
 
 from pydantic import BaseModel
 
+from skytrap.autonomy.intent import NormalizedIntent
 from skytrap.autonomy.risk import RiskAssessment, RiskLevel
 
 
@@ -19,6 +20,7 @@ class ApprovalRequest(BaseModel):
     tool_name: str
     arguments: dict
     assessment: RiskAssessment
+    normalized_intent: NormalizedIntent | None = None
 
 
 class ApprovalEngine:
@@ -31,6 +33,8 @@ class ApprovalEngine:
         self.auto_approve_through = auto_approve_through
 
     def decide(self, request: ApprovalRequest) -> ApprovalDecision:
+        if request.normalized_intent and request.normalized_intent.clarification_required:
+            return ApprovalDecision.PENDING
         if request.assessment.level <= self.auto_approve_through and not request.assessment.requires_approval:
             return ApprovalDecision.APPROVED
         if self.callback is None:
