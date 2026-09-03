@@ -113,19 +113,19 @@ même contrat quand le control plane aura besoin de transactions concurrentes.
 
 ## Roadmap incrémentale
 
-### Phase 4 — connexion aux outils existants
+### Phase 4 — connexion aux outils existants (implémentée)
 
-- fournir des outils `patch_file`, lint, typecheck et build de premier rang ;
-- centraliser les toolsets CLI/serveur derrière `ToolExecutor` ;
-- adapter chaque outil historique pour remplir stdout/stderr/exit_code nativement ;
-- ajouter un audit log durable avec arguments redacted.
+- outils `patch_file`, lint, typecheck, tests et build de premier rang ;
+- toolset autonome central partagé par CLI et serveur derrière `ToolExecutor` ;
+- appels enrichis avec stdout/stderr/exit code, risque, capability et IDs ;
+- arguments sensibles masqués dans les demandes d'approbation.
 
-### Phase 5 — CLI et serveur autonomes
+### Phase 5 — CLI et serveur autonomes (implémentée)
 
-- exposer `skytrap agent run PATH GOAL`, `resume`, `status`, `stop` ;
-- streamer événements, plans, appels outils et résultats de vérification ;
-- ajouter branche `skytrap/task-<id>`, checkpoint, rollback et commit optionnel ;
-- remplacer le pipeline serveur historique par le lifecycle commun.
+- commandes `skytrap agent run PATH GOAL`, `resume`, `status`, `stop` et `rollback` ;
+- événements de progression CLI et WebSocket (`/agent/tasks`) ;
+- branche `skytrap/task-<id>`, checkpoint automatique, diff final et rollback ciblé ;
+- lifecycle autonome commun via `AutonomousTaskService` et `AgentLoop`.
 
 ### Phase 6 — local agent et remote runner
 

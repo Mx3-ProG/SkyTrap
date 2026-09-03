@@ -1,11 +1,16 @@
 import shlex
 import time
+from pathlib import Path
 
 import typer
+from rich.panel import Panel
 from rich.text import Text
 
 import skytrap.tools.skills  # noqa: F401 - importing this runs every skill's @register_tool
 
+from skytrap.autonomy.approval import ApprovalRequest
+from skytrap.autonomy.service import AutonomousTaskService
+from skytrap.autonomy.state import TaskState, TaskStatus
 from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
 from skytrap.core.context import WorkspaceContext, detect_workspace
@@ -63,9 +68,136 @@ from skytrap.ui.terminal import (
 )
 
 app = typer.Typer(add_completion=False, invoke_without_command=True)
+agent_app = typer.Typer(help="Run and manage persistent autonomous coding tasks.")
 app.add_typer(security_app, name="security")
+app.add_typer(agent_app, name="agent")
 
 MAX_AUTOFIX_ATTEMPTS = 3
+
+
+def _approve_autonomous_action(request: ApprovalRequest) -> bool:
+    safe_arguments = {
+        key: value
+        for key, value in request.arguments.items()
+        if key not in {"content", "replacement", "expected"}
+    }
+    console.print(
+        Panel(
+            f"Tool: {request.tool_name}\nRisk: {request.assessment.level.name}\n"
+            f"Arguments: {safe_arguments}\nReasons: {', '.join(request.assessment.reasons)}",
+            title="Autonomous action requires approval",
+            border_style="yellow",
+        )
+    )
+    return typer.confirm("Approve this action?", default=False)
+
+
+def _print_autonomous_result(task: TaskState) -> None:
+    color = "green" if task.status == TaskStatus.COMPLETED else "yellow"
+    console.print(f"[{color}]Task {task.task_id}: {task.status.value}[/{color}]")
+    if task.task_branch:
+        console.print(f"[dim]Branch: {task.task_branch}[/dim]")
+    if task.checkpoint_commit:
+        console.print(f"[dim]Checkpoint: {task.checkpoint_commit}[/dim]")
+    if task.final_message:
+        console.print(Text(task.final_message))
+    if task.final_diff:
+        print_diff_summary(task.final_diff)
+
+
+def _autonomous_service() -> AutonomousTaskService:
+    last_status: list[str] = []
+
+    def on_event(event: dict) -> None:
+        state = event.get("task", {})
+        status = state.get("status")
+        iteration = state.get("iteration")
+        marker = f"{status}:{iteration}"
+        if status and marker not in last_status:
+            last_status[:] = [marker]
+            log_step(f"Agent {status} (iteration {iteration})")
+
+    return AutonomousTaskService(
+        OllamaProvider(),
+        approval_callback=_approve_autonomous_action,
+        on_event=on_event,
+    )
+
+
+@agent_app.command("run")
+def agent_run(
+    project: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    goal: str = typer.Argument(...),
+    max_iterations: int = typer.Option(20, min=1, max=200, help="Maximum model iterations."),
+) -> None:
+    """Run GOAL autonomously in PROJECT on a dedicated Git branch."""
+    service = _autonomous_service()
+    task = service.run(project, goal, max_iterations=max_iterations)
+    _print_autonomous_result(task)
+    if task.status != TaskStatus.COMPLETED:
+        raise typer.Exit(1)
+
+
+@agent_app.command("resume")
+def agent_resume(task_id: str) -> None:
+    """Resume a persisted interrupted, failed, blocked, or approval-paused task."""
+    service = _autonomous_service()
+    try:
+        task = service.resume(task_id)
+    except (OSError, ValueError, RuntimeError) as exc:
+        console.print(f"[bold red]Cannot resume task:[/bold red] {exc}")
+        raise typer.Exit(1) from exc
+    _print_autonomous_result(task)
+    if task.status != TaskStatus.COMPLETED:
+        raise typer.Exit(1)
+
+
+@agent_app.command("status")
+def agent_status(task_id: str | None = typer.Argument(None)) -> None:
+    """Show one persisted task, or list recent tasks when TASK_ID is omitted."""
+    service = _autonomous_service()
+    if task_id is None:
+        tasks = service.list_tasks()
+        if not tasks:
+            console.print("[dim]No autonomous tasks found.[/dim]")
+            return
+        for task in tasks:
+            console.print(
+                f"{task.task_id}  {task.status.value:<16}  {task.workspace_path}  {task.goal}"
+            )
+        return
+    try:
+        task = service.status(task_id)
+    except (OSError, ValueError, KeyError) as exc:
+        console.print(f"[bold red]Unknown task:[/bold red] {task_id}")
+        raise typer.Exit(1) from exc
+    _print_autonomous_result(task)
+
+
+@agent_app.command("stop")
+def agent_stop(task_id: str) -> None:
+    """Request a cooperative stop; the running process persists a resumable state."""
+    service = _autonomous_service()
+    try:
+        task = service.stop(task_id)
+    except (OSError, ValueError, KeyError) as exc:
+        console.print(f"[bold red]Cannot stop task:[/bold red] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(f"[yellow]Stop requested for task {task.task_id}.[/yellow]")
+
+
+@agent_app.command("rollback")
+def agent_rollback(task_id: str) -> None:
+    """Reset the dedicated task branch to its recorded base commit."""
+    service = _autonomous_service()
+    if not typer.confirm(f"Rollback task {task_id} to its base commit?", default=False):
+        raise typer.Abort()
+    try:
+        task = service.rollback(task_id)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        console.print(f"[bold red]Rollback failed:[/bold red] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Rolled back {task.task_branch} to {task.base_commit}.[/green]")
 
 
 def _build_full_toolset(

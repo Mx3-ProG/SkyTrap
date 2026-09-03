@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import shlex
+import shutil
 import subprocess
+import json
+import os
+from pathlib import Path
 from enum import StrEnum
 from time import monotonic
 
@@ -43,7 +47,69 @@ class VerificationLoop:
                 discovered[stage].append(commands.check_command)
             discovered[VerificationStage.TEST].extend(commands.test_commands)
             discovered[VerificationStage.BUILD].extend(commands.build_commands)
-        return {stage: list(dict.fromkeys(filter(None, commands))) for stage, commands in discovered.items()}
+        return {
+            stage: [
+                command
+                for command in dict.fromkeys(filter(None, commands))
+                if self._command_is_configured(workspace.path, command)
+            ]
+            for stage, commands in discovered.items()
+        }
+
+    @staticmethod
+    def _package_scripts(root: Path) -> tuple[dict, set[str]]:
+        try:
+            package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}, set()
+        dependencies = set(package.get("dependencies", {})) | set(package.get("devDependencies", {}))
+        return package.get("scripts", {}), dependencies
+
+    @classmethod
+    def _command_is_configured(cls, root: Path, command: str) -> bool:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        local_binary = root / "node_modules" / ".bin" / tokens[0]
+        venv_binary = root / ".venv" / "bin" / tokens[0]
+        if shutil.which(tokens[0]) is None and not local_binary.exists() and not venv_binary.exists():
+            return False
+
+        scripts, dependencies = cls._package_scripts(root)
+        managers = {"npm", "pnpm", "yarn", "bun"}
+        if tokens[0] in managers:
+            if tokens[0] == "npm" and len(tokens) >= 3 and tokens[1] == "run":
+                return tokens[2] in scripts
+            if len(tokens) >= 2 and tokens[1] in {"test", "build", "lint", "typecheck"}:
+                return tokens[1] in scripts
+            if len(tokens) >= 3 and tokens[1] == "run":
+                return tokens[2] in scripts
+
+        if tokens[0] == "npx" and len(tokens) >= 2:
+            binary = tokens[1]
+            return binary in dependencies or (root / "node_modules" / ".bin" / binary).exists()
+
+        if tokens[0] == "uv" and len(tokens) >= 3 and tokens[1] == "run":
+            tool = tokens[2]
+            try:
+                pyproject = (root / "pyproject.toml").read_text(encoding="utf-8").lower()
+            except OSError:
+                pyproject = ""
+            return tool.lower() in pyproject or (root / ".venv" / "bin" / tool).exists()
+
+        optional_tools = {"ruff", "mypy", "pyright", "golangci-lint", "clang-tidy", "rubocop", "tsc", "eslint"}
+        if tokens[0] in optional_tools:
+            return shutil.which(tokens[0]) is not None or (root / "node_modules" / ".bin" / tokens[0]).exists()
+
+        if tokens[:2] == ["make", "test"]:
+            try:
+                return "test:" in (root / "Makefile").read_text(encoding="utf-8")
+            except OSError:
+                return False
+        return True
 
     @staticmethod
     def _is_typecheck(command: str) -> bool:
@@ -82,14 +148,34 @@ class VerificationLoop:
             tokens = shlex.split(command)
         except ValueError as exc:
             return ToolResult(success=False, output=f"Could not parse verification command: {exc}", stderr=str(exc))
+        if shutil.which(tokens[0]) is None:
+            for candidate in (
+                workspace.path / "node_modules" / ".bin" / tokens[0],
+                workspace.path / ".venv" / "bin" / tokens[0],
+            ):
+                if candidate.exists():
+                    tokens[0] = str(candidate)
+                    break
+
+        expanded: list[str] = []
+        for token in tokens:
+            if any(marker in token for marker in ("*", "?", "[")):
+                matches = [str(path.relative_to(workspace.path)) for path in workspace.path.glob(token)]
+                expanded.extend(matches or [token])
+            else:
+                expanded.append(token)
+        tokens = expanded
         started = monotonic()
         try:
+            environment = os.environ.copy()
+            environment.setdefault("PYTHONDONTWRITEBYTECODE", "1")
             completed = subprocess.run(
                 tokens,
                 cwd=workspace.path,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
+                env=environment,
             )
         except FileNotFoundError:
             return ToolResult(success=False, output=f"Command not found: {tokens[0]}", stderr=f"Command not found: {tokens[0]}")

@@ -4,10 +4,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from skytrap.autonomy.state import TaskState
+from skytrap.autonomy.state import TaskState, TaskStatus
 
 
 class MemoryEvent(BaseModel):
@@ -62,7 +63,6 @@ class TaskStore:
 
     def __init__(self, root: Path):
         self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, task_id: str) -> Path:
         if not task_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in task_id):
@@ -70,15 +70,25 @@ class TaskStore:
         return self.root / f"{task_id}.json"
 
     def save(self, task: TaskState, memory: WorkingMemory) -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
         path = self._path(task.task_id)
-        temporary = path.with_suffix(".tmp")
+        if path.exists() and task.status != TaskStatus.CREATED and not task.stop_requested:
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                task.stop_requested = bool(existing["task"].get("stop_requested"))
+            except (OSError, ValueError, KeyError):
+                pass
+        temporary = self.root / f".{task.task_id}.{uuid4().hex}.tmp"
         payload = {
             "version": 1,
             "task": task.model_dump(mode="json"),
             "memory": memory.model_dump(mode="json"),
         }
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return path
 
     def load(self, task_id: str) -> tuple[TaskState, WorkingMemory]:
@@ -86,3 +96,30 @@ class TaskStore:
         if data.get("version") != 1:
             raise ValueError(f"Unsupported task state version: {data.get('version')}")
         return TaskState.model_validate(data["task"]), WorkingMemory.model_validate(data["memory"])
+
+    def list_tasks(self) -> list[TaskState]:
+        if not self.root.is_dir():
+            return []
+        tasks: list[TaskState] = []
+        for path in sorted(self.root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                tasks.append(TaskState.model_validate(data["task"]))
+            except (OSError, ValueError, KeyError):
+                continue
+        return tasks
+
+    def request_stop(self, task_id: str) -> TaskState:
+        task, memory = self.load(task_id)
+        if task.is_terminal:
+            raise ValueError(f"Task is already {task.status.value}")
+        task.stop_requested = True
+        self.save(task, memory)
+        return task
+
+    def is_stop_requested(self, task_id: str) -> bool:
+        try:
+            task, _ = self.load(task_id)
+        except (OSError, ValueError, KeyError):
+            return False
+        return task.stop_requested

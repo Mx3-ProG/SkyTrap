@@ -5,12 +5,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from skytrap.core.projects import ProjectStore
+from skytrap.autonomy.memory import TaskStore
 from skytrap.models.base import ModelProvider
 from skytrap.server.auth.email import load_email_sender
 from skytrap.server.auth.router import router as auth_router
 from skytrap.server.auth.store import AuthStore
 from skytrap.server.config import Settings, load_settings
 from skytrap.server.routers.projects import router as projects_router
+from skytrap.server.routers.agent_tasks import router as agent_tasks_router
 from skytrap.server.routers.turns import router as turns_router
 from skytrap.server.turns import TurnRegistry
 from skytrap.server.ws.connection import ConnectionManager
@@ -46,6 +48,7 @@ def create_app(
     # Deriving this from the injected AuthStore also keeps background task state in
     # the caller's isolated database (tests, embedded server, alternate profiles).
     app.state.memory_db_path = app.state.auth_store.db_path
+    app.state.autonomous_task_store = TaskStore(app.state.auth_store.db_path.parent / "tasks")
     app.state.email_sender = load_email_sender()
     app.state.connection_manager = ConnectionManager()
     app.state.turn_registry = TurnRegistry()
@@ -63,6 +66,7 @@ def create_app(
     app.include_router(auth_router)
     app.include_router(turns_router)
     app.include_router(projects_router)
+    app.include_router(agent_tasks_router)
     app.include_router(ws_router)
 
     # Serves the built PWA (npm run build in frontend/) once it exists. Mounted

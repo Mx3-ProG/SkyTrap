@@ -49,6 +49,13 @@ class TaskState(BaseModel):
     final_message: str | None = None
     error: str | None = None
     pending_approval: dict[str, Any] | None = None
+    stop_requested: bool = False
+    original_branch: str | None = None
+    task_branch: str | None = None
+    base_commit: str | None = None
+    checkpoint_commit: str | None = None
+    final_diff: str | None = None
+    rolled_back: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -67,6 +74,8 @@ class TaskState(BaseModel):
         if self.status == TaskStatus.COMPLETED:
             raise ValueError("A completed task cannot be resumed")
         self.run_id = uuid4().hex
+        self.iteration = 0
         self.status = TaskStatus.CREATED
         self.pending_approval = None
+        self.stop_requested = False
         self.updated_at = utc_now()

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 
 from skytrap.autonomy.executor import ToolExecutor
 from skytrap.autonomy.memory import TaskStore, WorkingMemory
 from skytrap.autonomy.planning import Planner, TaskPlan
 from skytrap.autonomy.state import TaskState, TaskStatus
-from skytrap.autonomy.verification import VerificationLoop
+from skytrap.autonomy.verification import VerificationLoop, VerificationResult, VerificationStage
 from skytrap.core.agent import _parse_decision
 from skytrap.core.context import WorkspaceContext
 from skytrap.models.base import ModelProvider
+from skytrap.tools.base import ToolResult
 
 
 AGENT_LOOP_PROMPT = """You are SkyTrap's autonomous implementation agent.
@@ -34,6 +34,7 @@ class AgentLoop:
         store: TaskStore,
         on_event: Callable[[dict], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        completion_hook: Callable[[WorkspaceContext, TaskState, WorkingMemory], ToolResult] | None = None,
     ):
         self.model = model
         self.planner = planner
@@ -42,9 +43,15 @@ class AgentLoop:
         self.store = store
         self.on_event = on_event
         self.should_stop = should_stop or (lambda: False)
+        self.completion_hook = completion_hook
 
-    def run(self, workspace: WorkspaceContext, task: TaskState) -> TaskState:
-        memory = WorkingMemory(objective=task.goal)
+    def run(
+        self,
+        workspace: WorkspaceContext,
+        task: TaskState,
+        memory: WorkingMemory | None = None,
+    ) -> TaskState:
+        memory = memory or WorkingMemory(objective=task.goal)
         return self._run(workspace, task, memory)
 
     def resume(self, workspace: WorkspaceContext, task_id: str) -> TaskState:
@@ -111,9 +118,21 @@ class AgentLoop:
                     continue
 
                 task.transition(TaskStatus.VERIFYING)
-                verification = self.verifier.run(workspace)
+                verification = self._verify(workspace, task, memory)
                 memory.verification_results.append(verification.model_dump(mode="json"))
                 if verification.success:
+                    if self.completion_hook is not None:
+                        checkpoint = self.completion_hook(workspace, task, memory)
+                        memory.record(
+                            "checkpoint",
+                            success=checkpoint.success,
+                            error=checkpoint.stderr or checkpoint.output if not checkpoint.success else None,
+                        )
+                        if not checkpoint.success:
+                            task.final_message = f"Verification passed but checkpoint failed: {checkpoint.output}"
+                            task.transition(TaskStatus.BLOCKED, error=task.final_message)
+                            self._save(task, memory)
+                            return task
                     task.final_message = decision.message or "Task completed and verified."
                     task.transition(TaskStatus.COMPLETED)
                     self._save(task, memory)
@@ -146,6 +165,42 @@ class AgentLoop:
             memory.errors.append(str(exc))
         self._save(task, memory)
         return task
+
+    def _verify(
+        self,
+        workspace: WorkspaceContext,
+        task: TaskState,
+        memory: WorkingMemory,
+    ) -> VerificationResult:
+        tool_names = {
+            VerificationStage.LINT: "lint",
+            VerificationStage.TYPECHECK: "typecheck",
+            VerificationStage.TEST: "run_tests",
+            VerificationStage.BUILD: "build",
+        }
+        if not all(name in self.executor.tools for name in tool_names.values()):
+            return self.verifier.run(workspace)
+
+        results: list[ToolResult] = []
+        skipped: list[VerificationStage] = []
+        for stage, tool_name in tool_names.items():
+            result = self.executor.execute(task, memory, workspace, tool_name, {})
+            if result.metadata.get("skipped"):
+                skipped.append(stage)
+                continue
+            results.append(result)
+            if not result.success:
+                return VerificationResult(
+                    success=False,
+                    results=results,
+                    failed_stage=stage,
+                    skipped_stages=skipped,
+                )
+        return VerificationResult(
+            success=bool(results),
+            results=results,
+            skipped_stages=skipped,
+        )
 
     def _initial_messages(
         self, task: TaskState, plan: TaskPlan, memory: WorkingMemory
