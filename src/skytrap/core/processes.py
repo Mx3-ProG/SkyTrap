@@ -2,6 +2,7 @@ import os
 import signal
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,16 @@ def _connect() -> sqlite3.Connection:
 
 
 def is_running(pid: int) -> bool:
+    # When SkyTrap is the parent, reap an exited child before probing the PID.  A
+    # zombie still responds to kill(pid, 0), and `ps` is not guaranteed to be
+    # available inside a constrained local-agent sandbox.
+    try:
+        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return False
+    except ChildProcessError:
+        pass  # not our child (for example, a process from an earlier invocation)
+
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
@@ -169,6 +180,15 @@ def stop_process(process_id: int) -> tuple[bool, str]:
     except ProcessLookupError:
         _mark_stopped(process_id)
         return False, f"Process #{process_id} (pid {record.pid}) was already not running"
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and is_running(record.pid):
+        time.sleep(0.05)
+    if is_running(record.pid):
+        try:
+            os.kill(record.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     _mark_stopped(process_id)
     return True, f"Stopped process #{process_id} (pid {record.pid})"

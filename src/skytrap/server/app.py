@@ -42,6 +42,10 @@ def create_app(
     app = FastAPI(title="SkyTrap")
     app.state.settings = settings or load_settings()
     app.state.auth_store = auth_store or AuthStore()
+    # Memory and auth intentionally share SkyTrap's SQLite database in production.
+    # Deriving this from the injected AuthStore also keeps background task state in
+    # the caller's isolated database (tests, embedded server, alternate profiles).
+    app.state.memory_db_path = app.state.auth_store.db_path
     app.state.email_sender = load_email_sender()
     app.state.connection_manager = ConnectionManager()
     app.state.turn_registry = TurnRegistry()

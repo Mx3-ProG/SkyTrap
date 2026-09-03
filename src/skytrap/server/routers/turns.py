@@ -33,12 +33,13 @@ def create_turn(
     workspace = detect_workspace(Path(payload.workspace))
     model = request.app.state.model_provider or OllamaProvider()
     bridge = connection_manager.bridge
+    memory_db_path = request.app.state.memory_db_path
 
     def worker() -> None:
         # SqliteMemory wraps a sqlite3 connection that must be created and used on
         # the same thread — created here (inside the worker thread itself), not in
         # the request handler, otherwise sqlite3 raises ProgrammingError.
-        memory = SqliteMemory()
+        memory = SqliteMemory(memory_db_path)
         session_id = memory.start_session(str(workspace.path))
         try:
 
