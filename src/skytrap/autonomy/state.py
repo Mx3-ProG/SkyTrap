@@ -15,6 +15,8 @@ def utc_now() -> datetime:
 
 class TaskStatus(StrEnum):
     CREATED = "created"
+    INTERPRETING = "interpreting"
+    NEEDS_CLARIFICATION = "needs_clarification"
     PLANNING = "planning"
     RUNNING = "running"
     VERIFYING = "verifying"
@@ -42,6 +44,7 @@ class TaskState(BaseModel):
     machine_id: str | None = None
     workspace_path: Path
     goal: str
+    normalized_intent: dict[str, Any] | None = None
     status: TaskStatus = TaskStatus.CREATED
     iteration: int = 0
     max_iterations: int = 20

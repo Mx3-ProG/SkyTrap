@@ -128,3 +128,57 @@ def test_write_file_sensitive_path_declined_leaves_nothing_written(tmp_path):
 
     assert result.success is False
     assert not (tmp_path / ".env").exists()
+
+
+def test_write_file_new_file_reports_diff_metadata_as_pure_additions(tmp_path):
+    tool = WriteFileTool(confirm=lambda preview: True)
+    result = tool.execute(_workspace(tmp_path), {"path": "new.py", "content": "a\nb\n"})
+
+    assert result.success is True
+    assert result.metadata["is_new_file"] is True
+    assert result.metadata["added_lines"] == 2
+    assert result.metadata["removed_lines"] == 0
+    assert "+a" in result.metadata["diff"]
+    assert "+b" in result.metadata["diff"]
+
+
+def test_write_file_overwrite_reports_unified_diff_metadata(tmp_path):
+    target = tmp_path / "existing.py"
+    target.write_text("one\ntwo\nthree\n")
+
+    tool = WriteFileTool(confirm=lambda preview: True)
+    result = tool.execute(_workspace(tmp_path), {"path": "existing.py", "content": "one\nTWO\nthree\n"})
+
+    assert result.success is True
+    assert result.metadata["is_new_file"] is False
+    assert result.metadata["added_lines"] == 1
+    assert result.metadata["removed_lines"] == 1
+    assert "-two" in result.metadata["diff"]
+    assert "+TWO" in result.metadata["diff"]
+
+
+def test_write_file_declined_write_has_no_diff_applied(tmp_path):
+    target = tmp_path / ".env"
+    target.write_text("SECRET=old\n")
+
+    tool = WriteFileTool(confirm=lambda preview: False)
+    result = tool.execute(_workspace(tmp_path), {"path": ".env", "content": "SECRET=new\n"})
+
+    assert result.success is False
+    assert target.read_text() == "SECRET=old\n"
+    assert result.metadata == {}
+
+
+def test_delete_file_reports_diff_metadata_as_pure_removals(tmp_path):
+    target = tmp_path / "gone.py"
+    target.write_text("x\ny\n")
+
+    tool = DeleteFileTool(confirm=lambda preview: True)
+    result = tool.execute(_workspace(tmp_path), {"path": "gone.py"})
+
+    assert result.success is True
+    assert result.metadata["is_delete"] is True
+    assert result.metadata["added_lines"] == 0
+    assert result.metadata["removed_lines"] == 2
+    assert "-x" in result.metadata["diff"]
+    assert "-y" in result.metadata["diff"]

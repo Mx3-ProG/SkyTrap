@@ -3,7 +3,6 @@ import time
 from pathlib import Path
 
 import typer
-from rich.panel import Panel
 from rich.text import Text
 
 import skytrap.tools.skills  # noqa: F401 - importing this runs every skill's @register_tool
@@ -13,7 +12,7 @@ from skytrap.autonomy.service import AutonomousTaskService
 from skytrap.autonomy.state import TaskState, TaskStatus
 from skytrap.core import processes
 from skytrap.core.agent import run_agent_turn
-from skytrap.core.context import WorkspaceContext, detect_workspace
+from skytrap.core.context import WorkspaceContext, detect_workspace, git_worktree_state
 from skytrap.core.intent import detect_execution_intent
 from skytrap.core.notes import run_summarizer
 from skytrap.core.project_inspection import inspect_project
@@ -44,6 +43,7 @@ from skytrap.tools.verification import (
     LighthouseAuditTool,
 )
 from skytrap.ui.terminal import (
+    AgentRenderer,
     ChatState,
     confirm_delete,
     confirm_implement_plan,
@@ -52,16 +52,19 @@ from skytrap.ui.terminal import (
     confirm_stop_process,
     confirm_write,
     console,
+    generate_command_map,
     log_file,
     log_step,
     make_mode_aware_confirm,
-    print_banner,
+    print_agent_event,
+    print_command_map,
     print_developer_summary,
     print_diff_summary,
     print_plan,
-    print_commands,
     print_project_detected,
     print_review,
+    print_risk_action,
+    print_startup_dashboard,
     print_task_report,
     print_test_result,
     run_chat_loop,
@@ -75,20 +78,24 @@ app.add_typer(agent_app, name="agent")
 MAX_AUTOFIX_ATTEMPTS = 3
 
 
-def _approve_autonomous_action(request: ApprovalRequest) -> bool:
+def _approve_autonomous_action(request: ApprovalRequest, renderer: AgentRenderer) -> bool:
     safe_arguments = {
         key: value
         for key, value in request.arguments.items()
         if key not in {"content", "replacement", "expected"}
     }
-    console.print(
-        Panel(
-            f"Tool: {request.tool_name}\nRisk: {request.assessment.level.name}\n"
-            f"Arguments: {safe_arguments}\nReasons: {', '.join(request.assessment.reasons)}",
-            title="Autonomous action requires approval",
-            border_style="yellow",
-        )
+    action = str(
+        safe_arguments.get("command")
+        or safe_arguments.get("path")
+        or f"{request.tool_name} {safe_arguments}"
     )
+    renderer.render_risk_prompt(
+        request.assessment.level.name,
+        action,
+        request.assessment.capability.value,
+    )
+    if request.assessment.reasons:
+        console.print(Text(" · ".join(request.assessment.reasons), style="dim"))
     return typer.confirm("Approve this action?", default=False)
 
 
@@ -105,45 +112,50 @@ def _print_autonomous_result(task: TaskState) -> None:
         print_diff_summary(task.final_diff)
 
 
-def _autonomous_service() -> AutonomousTaskService:
-    last_status: list[str] = []
+def _autonomous_service(*, full_diff: bool = False) -> AutonomousTaskService:
+    renderer = AgentRenderer(full_diff=full_diff)
 
-    def on_event(event: dict) -> None:
-        state = event.get("task", {})
-        status = state.get("status")
-        iteration = state.get("iteration")
-        marker = f"{status}:{iteration}"
-        if status and marker not in last_status:
-            last_status[:] = [marker]
-            log_step(f"Agent {status} (iteration {iteration})")
+    def approval_callback(request: ApprovalRequest) -> bool:
+        return _approve_autonomous_action(request, renderer)
 
     return AutonomousTaskService(
         OllamaProvider(),
-        approval_callback=_approve_autonomous_action,
-        on_event=on_event,
+        approval_callback=approval_callback,
+        on_event=renderer.handle_event,
     )
 
 
 @agent_app.command("run")
 def agent_run(
-    project: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    path: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
     goal: str = typer.Argument(...),
     max_iterations: int = typer.Option(20, min=1, max=200, help="Maximum model iterations."),
+    full_diff: bool = typer.Option(
+        False, "--full-diff", help="Show every diff in full, without collapsing unchanged context lines."
+    ),
 ) -> None:
-    """Run GOAL autonomously in PROJECT on a dedicated Git branch."""
-    service = _autonomous_service()
-    task = service.run(project, goal, max_iterations=max_iterations)
+    """Run GOAL autonomously in PATH on a dedicated Git branch."""
+    service = _autonomous_service(full_diff=full_diff)
+    task = service.run(path, goal, max_iterations=max_iterations)
     _print_autonomous_result(task)
     if task.status != TaskStatus.COMPLETED:
         raise typer.Exit(1)
 
 
 @agent_app.command("resume")
-def agent_resume(task_id: str) -> None:
+def agent_resume(
+    task_id: str,
+    answer: str | None = typer.Option(
+        None, "--answer", "-a", help="Answer a pending THE PATH FORKS clarification."
+    ),
+    full_diff: bool = typer.Option(
+        False, "--full-diff", help="Show every diff in full, without collapsing unchanged context lines."
+    ),
+) -> None:
     """Resume a persisted interrupted, failed, blocked, or approval-paused task."""
-    service = _autonomous_service()
+    service = _autonomous_service(full_diff=full_diff)
     try:
-        task = service.resume(task_id)
+        task = service.resume(task_id, clarification=answer)
     except (OSError, ValueError, RuntimeError) as exc:
         console.print(f"[bold red]Cannot resume task:[/bold red] {exc}")
         raise typer.Exit(1) from exc
@@ -297,36 +309,45 @@ def main(ctx: typer.Context) -> None:
     # turns carry no memory at all (they're excluded from `history`), so "Go." would
     # go right back to the read-only Architect with no idea what plan it just gave.
     last_plan: list[str] = []
+    renderer = AgentRenderer()
 
     def on_step(step: dict) -> None:
+        renderer.finish_activity()
         tool = step.get("tool")
-        if tool == "write_file":
-            path = (step.get("arguments") or {}).get("path")
-            if path:
-                log_file(path, git_file_action(workspace, path))
-        elif tool == "delete_file":
-            path = (step.get("arguments") or {}).get("path")
-            if path:
-                log_file(path, "D")
+        arguments = step.get("arguments") or {}
+        metadata = step.get("metadata") or {}
+        success = step.get("success", True)
+        if tool in {"write_file", "delete_file"}:
+            path = arguments.get("path")
+            if path and success:
+                is_delete = tool == "delete_file"
+                log_file(path, "D" if is_delete else git_file_action(workspace, path))
+                diff_text = metadata.get("diff")
+                if diff_text:
+                    renderer.render_diff(path, diff_text, title_prefix="DELETE" if is_delete else "PATCH")
         elif tool:
-            log_step(f"{tool} {step.get('arguments') or ''}".strip())
+            log_step(f"{tool} {arguments}".strip())
+        renderer.start_activity("Planning next move...")
 
     def respond(user_input: str, chat_state: ChatState) -> None:
         execute_intent = detect_execution_intent(user_input)
 
         if chat_state.mode == "plan" and execute_intent and last_plan:
-            log_step("Executing the previously agreed plan...")
+            renderer.start_activity("Executing the previously agreed plan...")
             augmented_input = f"{user_input}\n\nPreviously agreed plan:\n{last_plan[0]}"
-            reply = run_agent_turn(
-                model,
-                tools,
-                workspace,
-                history,
-                augmented_input,
-                max_steps=DEVELOPER_MAX_STEPS,
-                require_execution_evidence=True,
-                on_step=on_step,
-            )
+            try:
+                reply = run_agent_turn(
+                    model,
+                    tools,
+                    workspace,
+                    history,
+                    augmented_input,
+                    max_steps=DEVELOPER_MAX_STEPS,
+                    require_execution_evidence=True,
+                    on_step=on_step,
+                )
+            finally:
+                renderer.finish_activity()
             memory.record_message(session_id, "user", user_input)
             memory.record_message(session_id, "assistant", reply)
             console.print(Text(reply))
@@ -345,25 +366,40 @@ def main(ctx: typer.Context) -> None:
             )
             return
 
-        log_step("Working...")
-        reply = run_agent_turn(
-            model,
-            tools,
-            workspace,
-            history,
-            user_input,
-            max_steps=DEVELOPER_MAX_STEPS,
-            require_execution_evidence=execute_intent,
-            on_step=on_step,
-        )
+        renderer.start_activity("Planning next move...")
+        try:
+            reply = run_agent_turn(
+                model,
+                tools,
+                workspace,
+                history,
+                user_input,
+                max_steps=DEVELOPER_MAX_STEPS,
+                require_execution_evidence=execute_intent,
+                on_step=on_step,
+            )
+        finally:
+            renderer.finish_activity()
         memory.record_message(session_id, "user", user_input)
         memory.record_message(session_id, "assistant", reply)
         console.print(Text(reply))
 
-    print_banner(model, workspace)
-    print_project_detected(inspect_project(workspace))
+    memory_state = (
+        "ready · continuity available"
+        if memory.list_notes(str(workspace.path), limit=1)
+        else "ready · empty"
+    )
+    print_startup_dashboard(
+        workspace,
+        model.name,
+        model.is_available(),
+        git_worktree_state(workspace),
+        f"{model.engine} / {state.mode}",
+        memory_state,
+    )
+    print_command_map(generate_command_map(typer.main.get_command(app)), compact=True)
     try:
-        run_chat_loop(respond, state=state)
+        run_chat_loop(respond, state=state, workspace=workspace)
     finally:
         # Only worth a note if something actually happened — not for a two-message
         # "hi"/"hello" exchange. len(history) counts message-pairs from completed
@@ -383,11 +419,7 @@ def main(ctx: typer.Context) -> None:
 def commands() -> None:
     """List every available `skytrap` command with a one-line description."""
     click_command = typer.main.get_command(app)
-    rows = [
-        (name, sub.get_short_help_str(80))
-        for name, sub in sorted(click_command.commands.items())
-    ]
-    print_commands(rows)
+    print_command_map(generate_command_map(click_command))
 
 
 @app.command()

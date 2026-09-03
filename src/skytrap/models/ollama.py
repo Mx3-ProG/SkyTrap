@@ -23,3 +23,12 @@ class OllamaProvider(ModelProvider):
         )
         response.raise_for_status()
         return response.json()["message"]["content"]
+
+    def is_available(self, timeout: float = 0.5) -> bool:
+        """Fast health probe used by the startup dashboard; never raises offline."""
+        try:
+            response = httpx.get(f"{self.base_url}/api/tags", timeout=timeout)
+            response.raise_for_status()
+        except httpx.HTTPError:
+            return False
+        return True

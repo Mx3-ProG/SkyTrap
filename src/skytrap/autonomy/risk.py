@@ -4,6 +4,7 @@ from enum import IntEnum, StrEnum
 
 from pydantic import BaseModel, Field
 
+from skytrap.autonomy.intent import IntentRisk, NormalizedIntent
 from skytrap.core.tool_safety import classify_command, classify_path
 
 
@@ -38,7 +39,18 @@ WRITE_TOOLS = {"write_file", "patch_file", "delete_file"}
 class RiskEngine:
     """Classifies requested actions before an executor sees credentials or runs code."""
 
-    def assess(self, tool_name: str, arguments: dict) -> RiskAssessment:
+    def assess(
+        self,
+        tool_name: str,
+        arguments: dict,
+        intent: NormalizedIntent | None = None,
+    ) -> RiskAssessment:
+        assessment = self._assess_tool(tool_name, arguments)
+        if intent is None:
+            return assessment
+        return self._combine_with_intent(assessment, intent)
+
+    def _assess_tool(self, tool_name: str, arguments: dict) -> RiskAssessment:
         if tool_name in READ_TOOLS:
             return RiskAssessment(level=RiskLevel.LOW, capability=Capability.FILESYSTEM_READ)
 
@@ -96,4 +108,38 @@ class RiskEngine:
             level=RiskLevel.MEDIUM,
             capability=Capability.SHELL_EXECUTE,
             reasons=["Unknown tool defaults to constrained execution"],
+        )
+
+    @staticmethod
+    def _combine_with_intent(
+        assessment: RiskAssessment, intent: NormalizedIntent
+    ) -> RiskAssessment:
+        intent_level = {
+            IntentRisk.LOW: RiskLevel.LOW,
+            IntentRisk.MEDIUM: RiskLevel.MEDIUM,
+            IntentRisk.HIGH: RiskLevel.HIGH,
+            IntentRisk.CRITICAL: RiskLevel.CRITICAL,
+        }[intent.risk]
+        mutating = assessment.capability in {
+            Capability.FILESYSTEM_WRITE,
+            Capability.GIT_COMMIT,
+            Capability.GIT_PUSH,
+            Capability.DEPLOY_EXECUTE,
+            Capability.SECRETS_USE,
+        }
+        level = max(assessment.level, intent_level) if mutating else assessment.level
+        reasons = list(assessment.reasons)
+        if mutating and intent_level > assessment.level:
+            reasons.append(f"Human intent consequence level: {intent.risk.value}")
+        if intent.ambiguities and mutating:
+            reasons.append("The normalized intent contains unresolved ambiguity")
+        if intent.contradictions and mutating:
+            reasons.append("The normalized intent contains contradictory constraints")
+        return assessment.model_copy(
+            update={
+                "level": level,
+                "reasons": reasons,
+                "requires_approval": assessment.requires_approval
+                or (mutating and (intent.clarification_required or level >= RiskLevel.HIGH)),
+            }
         )

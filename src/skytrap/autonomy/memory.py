@@ -21,6 +21,9 @@ class WorkingMemory(BaseModel):
     """Bounded, serializable evidence accumulated during an autonomous task."""
 
     objective: str
+    conversation: list[dict[str, str]] = Field(default_factory=list)
+    referenced_entities: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     files_consulted: list[str] = Field(default_factory=list)
     files_modified: list[str] = Field(default_factory=list)
@@ -49,6 +52,10 @@ class WorkingMemory(BaseModel):
     def compact_context(self, max_events: int = 20) -> str:
         payload = {
             "objective": self.objective,
+            "conversation": self.conversation[-12:],
+            "referenced_entities": self.referenced_entities[-20:],
+            "assumptions": self.assumptions[-20:],
+            "decisions": self.decisions[-20:],
             "files_consulted": self.files_consulted[-30:],
             "files_modified": self.files_modified[-30:],
             "commands_executed": self.commands_executed[-20:],

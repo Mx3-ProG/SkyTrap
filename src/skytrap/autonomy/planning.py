@@ -6,6 +6,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, ValidationError
 
+from skytrap.autonomy.intent import HumanIntentEngine, NormalizedIntent
 from skytrap.core.context import WorkspaceContext
 from skytrap.core.project_inspection import inspect_project, resolve_commands
 from skytrap.core.repo_map import build_repo_map
@@ -70,7 +71,13 @@ class Planner:
     def __init__(self, model: ModelProvider):
         self.model = model
 
-    def create_plan(self, workspace: WorkspaceContext, goal: str) -> TaskPlan:
+    def create_plan(
+        self, workspace: WorkspaceContext, intent: NormalizedIntent | str
+    ) -> TaskPlan:
+        # String compatibility keeps third-party integrations working, while the
+        # autonomous runtime always supplies the structured contract.
+        if isinstance(intent, str):
+            intent = HumanIntentEngine().normalize(intent, workspace=workspace)
         profile = inspect_project(workspace)
         commands: list[str] = []
         for match in profile.languages[:3]:
@@ -82,7 +89,8 @@ class Planner:
             commands.extend(resolved.build_commands)
 
         prompt = (
-            f"Goal:\n{goal}\n\nRepository map:\n{build_repo_map(workspace)}\n\n"
+            "Normalized human intent (authoritative contract; raw_input is retained as evidence):\n"
+            f"{intent.model_dump_json(indent=2)}\n\nRepository map:\n{build_repo_map(workspace)}\n\n"
             f"Detected validation commands:\n" + "\n".join(dict.fromkeys(commands))
         )
         raw = self.model.chat(
@@ -96,7 +104,7 @@ class Planner:
                 pass
 
         return TaskPlan(
-            summary=f"Inspect, implement and verify: {goal}",
+            summary=f"Inspect, implement and verify: {intent.interpreted_goal}",
             steps=[
                 PlanStep(
                     id="step-1",
@@ -112,7 +120,11 @@ class Planner:
             ],
             commands=list(dict.fromkeys(commands)),
             tests=[command for command in commands if "test" in command or "pytest" in command],
-            risks=["Model output was not a valid structured plan; deterministic fallback used"],
+            risks=[
+                *intent.contradictions,
+                *intent.ambiguities,
+                "Model output was not a valid structured plan; deterministic fallback used",
+            ],
             success_criteria=["Implementation is present", "All available verification commands pass"],
         )
 

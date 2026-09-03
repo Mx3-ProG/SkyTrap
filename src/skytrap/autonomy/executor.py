@@ -4,6 +4,7 @@ from time import monotonic
 from uuid import uuid4
 
 from skytrap.autonomy.approval import ApprovalDecision, ApprovalEngine, ApprovalRequest
+from skytrap.autonomy.intent import NormalizedIntent
 from skytrap.autonomy.memory import WorkingMemory
 from skytrap.autonomy.risk import Capability, RiskEngine
 from skytrap.autonomy.state import TaskState
@@ -39,7 +40,12 @@ class ToolExecutor:
         arguments: dict,
     ) -> ToolResult:
         call_id = uuid4().hex
-        assessment = self.risk_engine.assess(tool_name, arguments)
+        intent = (
+            NormalizedIntent.model_validate(task.normalized_intent)
+            if task.normalized_intent is not None
+            else None
+        )
+        assessment = self.risk_engine.assess(tool_name, arguments, intent)
         metadata = {
             "tool_call_id": call_id,
             "task_id": task.task_id,

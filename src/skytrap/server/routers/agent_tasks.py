@@ -19,6 +19,10 @@ class AgentTaskRequest(BaseModel):
     max_iterations: int = Field(default=20, ge=1, le=200)
 
 
+class AgentResumeRequest(BaseModel):
+    clarification: str | None = None
+
+
 def _service(request: Request) -> AutonomousTaskService:
     manager = request.app.state.connection_manager
     bridge = manager.bridge
@@ -77,6 +81,12 @@ def create_agent_task(
     task = service.start(Path(payload.workspace), payload.goal, payload.max_iterations)
     if task.status == TaskStatus.BLOCKED:
         raise HTTPException(status_code=409, detail=task.error)
+    if task.status == TaskStatus.NEEDS_CLARIFICATION:
+        return {
+            "task_id": task.task_id,
+            "status": task.status.value,
+            "clarification_question": task.final_message,
+        }
     _launch(service, task.task_id, manager)
     return {"task_id": task.task_id, "status": task.status.value, "branch": task.task_branch}
 
@@ -98,6 +108,7 @@ def get_agent_task(
 def resume_agent_task(
     task_id: str,
     request: Request,
+    payload: AgentResumeRequest | None = None,
     user_id: int = Depends(get_current_user_id),
 ) -> dict:
     manager = request.app.state.connection_manager
@@ -111,7 +122,9 @@ def resume_agent_task(
 
     def worker() -> None:
         try:
-            task = service.resume(task_id)
+            task = service.resume(
+                task_id, clarification=payload.clarification if payload else None
+            )
             payload = {"type": "agent_task_complete", "task": task.model_dump(mode="json")}
         except Exception as exc:  # noqa: BLE001
             payload = {"type": "agent_task_error", "task_id": task_id, "error": str(exc)}

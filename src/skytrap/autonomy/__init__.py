@@ -3,6 +3,13 @@
 from skytrap.autonomy.approval import ApprovalDecision, ApprovalEngine, ApprovalRequest
 from skytrap.autonomy.executor import ToolExecutor
 from skytrap.autonomy.git_workflow import GitWorkflow
+from skytrap.autonomy.intent import (
+    HumanIntentEngine,
+    IntentContext,
+    IntentMessage,
+    IntentRisk,
+    NormalizedIntent,
+)
 from skytrap.autonomy.loop import AgentLoop
 from skytrap.autonomy.memory import TaskStore, WorkingMemory
 from skytrap.autonomy.patching import PatchEngine
@@ -22,8 +29,13 @@ __all__ = [
     "Capability",
     "BuildTool",
     "GitWorkflow",
+    "HumanIntentEngine",
+    "IntentContext",
+    "IntentMessage",
+    "IntentRisk",
     "LintTool",
     "ListFilesTool",
+    "NormalizedIntent",
     "PatchEngine",
     "PatchFileTool",
     "PlanStep",

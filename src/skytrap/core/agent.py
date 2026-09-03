@@ -292,16 +292,28 @@ def run_agent_turn(
             return final_message
 
         tool = tools_by_name.get(decision.tool or "")
+        metadata: dict = {}
+        success = False
         if tool is None:
             observation = f"ERROR: unknown tool '{decision.tool}'"
         else:
             result = tool.execute(workspace, decision.arguments)
             observation = result.output if result.success else f"ERROR: {result.output}"
+            metadata = result.metadata
+            success = result.success
             if result.success and decision.tool in MUTATING_TOOL_NAMES:
                 mutating_calls_made += 1
 
         if on_step is not None:
-            on_step({"tool": decision.tool, "arguments": decision.arguments, "observation": observation})
+            on_step(
+                {
+                    "tool": decision.tool,
+                    "arguments": decision.arguments,
+                    "observation": observation,
+                    "metadata": metadata,
+                    "success": success,
+                }
+            )
 
         messages.append(
             {"role": "user", "content": f"Tool result for {decision.tool}:\n{observation}"}

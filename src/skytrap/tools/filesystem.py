@@ -140,8 +140,10 @@ class WriteFileTool(Tool):
                 success=False, output=f"'{path_arg}' exists and is not a regular file"
             )
 
+        is_new_file, diff_text, added, removed = self._compute_diff(path_arg, file_path, content)
+
         if classify_path(path_arg) == "DESTRUCTIVE":
-            preview = self._build_preview(path_arg, file_path, content)
+            preview = self._build_preview(path_arg, is_new_file, diff_text, content)
             if not self._confirm(preview):
                 return ToolResult(
                     success=False, output="User declined the write; file not modified."
@@ -151,17 +153,42 @@ class WriteFileTool(Tool):
         file_path.write_text(content, encoding="utf-8")
         if self._on_write:
             self._on_write(path_arg)
-        return ToolResult(success=True, output=f"Wrote {len(content)} characters to {path_arg}")
+        return ToolResult(
+            success=True,
+            output=f"Wrote {len(content)} characters to {path_arg}",
+            metadata={
+                "diff": diff_text,
+                "is_new_file": is_new_file,
+                "added_lines": added,
+                "removed_lines": removed,
+            },
+        )
 
     @staticmethod
-    def _build_preview(path_arg: str, file_path: Path, new_content: str) -> str:
+    def _compute_diff(
+        path_arg: str, file_path: Path, new_content: str
+    ) -> tuple[bool, str, int, int]:
+        """Computes a unified diff (and +/- line counts) between what's on disk and
+        `new_content`, unconditionally — used both for the DESTRUCTIVE-path
+        confirmation preview and for live diff rendering of every write, regardless
+        of confirmation tier. Returns (is_new_file, diff_text, added, removed)."""
         if not file_path.exists():
-            return f"NEW FILE: {path_arg}\n\n{new_content}"
+            added = len(new_content.splitlines())
+            diff_lines = list(
+                difflib.unified_diff(
+                    [],
+                    new_content.splitlines(),
+                    fromfile="/dev/null",
+                    tofile=f"b/{path_arg}",
+                    lineterm="",
+                )
+            )
+            return True, "\n".join(diff_lines), added, 0
 
         try:
             old_content = file_path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, ValueError):
-            return f"Overwriting binary/unreadable file: {path_arg}\n\n{new_content}"
+            return False, "(binary/unreadable file — no diff available)", 0, 0
 
         diff_lines = list(
             difflib.unified_diff(
@@ -172,7 +199,15 @@ class WriteFileTool(Tool):
                 lineterm="",
             )
         )
-        return "\n".join(diff_lines) or "(no textual changes)"
+        added = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+        removed = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+        return False, "\n".join(diff_lines), added, removed
+
+    @staticmethod
+    def _build_preview(path_arg: str, is_new_file: bool, diff_text: str, new_content: str) -> str:
+        if is_new_file:
+            return f"NEW FILE: {path_arg}\n\n{new_content}"
+        return diff_text or "(no textual changes)"
 
 
 MAX_DELETE_PREVIEW_CHARS = 2_000
@@ -213,6 +248,8 @@ class DeleteFileTool(Tool):
                 success=False, output=f"'{path_arg}' is not a regular file — refusing to delete"
             )
 
+        diff_text, removed = self._compute_diff(path_arg, file_path)
+
         if classify_path(path_arg) == "DESTRUCTIVE":
             preview = self._build_preview(path_arg, file_path)
             if not self._confirm(preview):
@@ -223,7 +260,36 @@ class DeleteFileTool(Tool):
         file_path.unlink()
         if self._on_delete:
             self._on_delete(path_arg)
-        return ToolResult(success=True, output=f"Deleted {path_arg}")
+        return ToolResult(
+            success=True,
+            output=f"Deleted {path_arg}",
+            metadata={
+                "diff": diff_text,
+                "is_new_file": False,
+                "is_delete": True,
+                "added_lines": 0,
+                "removed_lines": removed,
+            },
+        )
+
+    @staticmethod
+    def _compute_diff(path_arg: str, file_path: Path) -> tuple[str, int]:
+        """Unified diff representing the whole file going away — same shape as
+        WriteFileTool's diff, so the renderer can treat both uniformly."""
+        try:
+            old_content = file_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return "(binary/unreadable file — no diff available)", 0
+        diff_lines = list(
+            difflib.unified_diff(
+                old_content.splitlines(),
+                [],
+                fromfile=f"a/{path_arg}",
+                tofile="/dev/null",
+                lineterm="",
+            )
+        )
+        return "\n".join(diff_lines), len(old_content.splitlines())
 
     @staticmethod
     def _build_preview(path_arg: str, file_path: Path) -> str:

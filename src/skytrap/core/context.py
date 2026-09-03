@@ -41,3 +41,22 @@ def detect_workspace(cwd: Path | None = None) -> WorkspaceContext:
         is_git=is_git,
         branch=branch or None,
     )
+
+
+def git_worktree_state(workspace: WorkspaceContext) -> str:
+    """Return a compact, truthful Git state for terminal status displays."""
+    if not workspace.is_git:
+        return "not a git repository"
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=workspace.path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return "unavailable"
+    if result.returncode != 0:
+        return "unavailable"
+    return "dirty" if result.stdout.strip() else "clean"
